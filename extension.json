@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "name": "inkling2",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.0",
+  "entry": "inkling2_register",
+  "registration_target": "gufo_inkling2",
+  "depends": [],
+  "platforms": [
+    "linux"
+  ],
+  "providers": [
+    {
+      "id": "inkling2",
+      "capability": "text_generation",
+      "keys": [
+        "gguf:inkling2_loop",
+        "gguf:inkling2"
+      ],
+      "model_ids": [
+        "inkling-2-mini"
+      ],
+      "target": "gufo_inkling2_hip",
+      "entry": "inkling2_provider_register"
+    }
+  ],
+  "targets": {
+    "gufo_inkling2": {
+      "requires": []
+    },
+    "gufo_inkling2_hip": {
+      "requires": [
+        "hip"
+      ]
+    },
+    "inkling2_probe_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "inkling2_weights_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "inkling2_bench": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "inkling2_oracle": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "inkling2_image_oracle": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "inkling2_cache_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    }
+  },
+  "licenses": [
+    "LICENSE",
+    "THIRD_PARTY.md"
+  ]
+}

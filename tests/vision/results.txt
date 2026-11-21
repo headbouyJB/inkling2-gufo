@@ -1,0 +1,39 @@
+load 2.90s
+img/tiny_40x40.png 40x40 -> 1 tokens (1x1, pad 40x40, 4 patches) | encode wmma: first 11.6 ms, median of 5 = 10.2 ms
+== tiny_40x40
+fast vs cpu: tokens 1 dim 2304 | cos min 0.999710 (tok 0) mean 0.999710 | max|err| 0.01931 (tok 0) mean-of-token-max 0.01931 | rel-L2 mean 0.02409 max 0.02409
+fast vs cpufa0: tokens 1 dim 2304 | cos min 0.999814 (tok 0) mean 0.999814 | max|err| 0.01645 (tok 0) mean-of-token-max 0.01645 | rel-L2 mean 0.01931 max 0.01931
+fast vs gpu: tokens 1 dim 2304 | cos min 0.999771 (tok 0) mean 0.999771 | max|err| 0.01531 (tok 0) mean-of-token-max 0.01531 | rel-L2 mean 0.02142 max 0.02142
+fast vs exact: tokens 1 dim 2304 | cos min 1.000000 (tok 0) mean 1.000000 | max|err| 0.0007099 (tok 0) mean-of-token-max 0.0007099 | rel-L2 mean 0.0008288 max 0.0008288
+exact vs cpu: tokens 1 dim 2304 | cos min 0.999716 (tok 0) mean 0.999716 | max|err| 0.01888 (tok 0) mean-of-token-max 0.01888 | rel-L2 mean 0.02386 max 0.02386
+emu vs cpufa0: tokens 1 dim 2304 | cos min 0.999837 (tok 0) mean 0.999837 | max|err| 0.01724 (tok 0) mean-of-token-max 0.01724 | rel-L2 mean 0.01807 max 0.01807
+cpu vs gpu: tokens 1 dim 2304 | cos min 0.999663 (tok 0) mean 0.999663 | max|err| 0.01773 (tok 0) mean-of-token-max 0.01773 | rel-L2 mean 0.02595 max 0.02595
+cpu vs cpufa0: tokens 1 dim 2304 | cos min 0.999745 (tok 0) mean 0.999745 | max|err| 0.01842 (tok 0) mean-of-token-max 0.01842 | rel-L2 mean 0.02264 max 0.02264
+load 2.90s
+img/shapes_512x320.png 512x320 -> 104 tokens (13x8, pad 520x320, 416 patches) | encode wmma: first 25.9 ms, median of 5 = 22.9 ms
+== shapes_512x320
+fast vs cpu: tokens 104 dim 2304 | cos min 0.984624 (tok 15) mean 0.999251 | max|err| 0.06889 (tok 95) mean-of-token-max 0.01393 | rel-L2 mean 0.02951 max 0.1747
+fast vs cpufa0: tokens 104 dim 2304 | cos min 0.978073 (tok 15) mean 0.999205 | max|err| 0.07063 (tok 15) mean-of-token-max 0.01413 | rel-L2 mean 0.03001 max 0.2085
+fast vs gpu: tokens 104 dim 2304 | cos min 0.978341 (tok 15) mean 0.999074 | max|err| 0.07576 (tok 15) mean-of-token-max 0.01562 | rel-L2 mean 0.03248 max 0.2075
+fast vs exact: tokens 104 dim 2304 | cos min 0.999986 (tok 77) mean 0.999999 | max|err| 0.002373 (tok 77) mean-of-token-max 0.0006614 | rel-L2 mean 0.001381 max 0.005515
+exact vs cpu: tokens 104 dim 2304 | cos min 0.984548 (tok 15) mean 0.999254 | max|err| 0.06995 (tok 95) mean-of-token-max 0.01393 | rel-L2 mean 0.02945 max 0.1751
+emu vs cpufa0: tokens 104 dim 2304 | cos min 0.993991 (tok 63) mean 0.999559 | max|err| 0.03663 (tok 63) mean-of-token-max 0.01279 | rel-L2 mean 0.02631 max 0.1096
+cpu vs gpu: tokens 104 dim 2304 | cos min 0.993066 (tok 77) mean 0.999355 | max|err| 0.05536 (tok 95) mean-of-token-max 0.01525 | rel-L2 mean 0.03161 max 0.1191
+cpu vs cpufa0: tokens 104 dim 2304 | cos min 0.994957 (tok 2) mean 0.999501 | max|err| 0.05995 (tok 95) mean-of-token-max 0.01356 | rel-L2 mean 0.02789 max 0.1003
+load 2.91s
+img/big_1280x720.png 1280x720 -> 576 tokens (32x18, pad 1280x720, 2304 patches) | encode wmma: first 140.5 ms, median of 5 = 133.0 ms
+== big_1280x720
+fast vs cpu: tokens 576 dim 2304 | cos min 0.988107 (tok 548) mean 0.999623 | max|err| 0.07804 (tok 548) mean-of-token-max 0.01148 | rel-L2 mean 0.02372 max 0.1558
+fast vs cpufa0: tokens 576 dim 2304 | cos min 0.979769 (tok 520) mean 0.999602 | max|err| 0.07323 (tok 520) mean-of-token-max 0.01147 | rel-L2 mean 0.02366 max 0.2018
+fast vs gpu: tokens 576 dim 2304 | cos min 0.976354 (tok 548) mean 0.999346 | max|err| 0.1283 (tok 548) mean-of-token-max 0.01577 | rel-L2 mean 0.03194 max 0.2175
+fast vs exact: tokens 576 dim 2304 | cos min 0.999977 (tok 18) mean 0.999999 | max|err| 0.002675 (tok 520) mean-of-token-max 0.0005929 | rel-L2 mean 0.001203 max 0.006735
+exact vs cpu: tokens 576 dim 2304 | cos min 0.987895 (tok 548) mean 0.999623 | max|err| 0.07852 (tok 548) mean-of-token-max 0.01147 | rel-L2 mean 0.02369 max 0.1569
+emu vs cpufa0: tokens 576 dim 2304 | cos min 0.993966 (tok 39) mean 0.999606 | max|err| 0.0504 (tok 55) mean-of-token-max 0.0125 | rel-L2 mean 0.02561 max 0.1125
+cpu vs gpu: tokens 576 dim 2304 | cos min 0.991362 (tok 424) mean 0.999251 | max|err| 0.09957 (tok 72) mean-of-token-max 0.01739 | rel-L2 mean 0.03539 max 0.1387
+cpu vs cpufa0: tokens 576 dim 2304 | cos min 0.994903 (tok 520) mean 0.999629 | max|err| 0.06188 (tok 197) mean-of-token-max 0.01238 | rel-L2 mean 0.02533 max 0.1118
+40x40 -> 1 tokens (4 patches): warm-up 12 ms, median 10.1 ms (10.12 ms/token)
+513x321 -> 117 tokens (468 patches): warm-up 25 ms, median 23.2 ms (0.20 ms/token)
+1920x1080 -> 1296 tokens (5184 patches): warm-up 395 ms, median 381.8 ms (0.29 ms/token)
+2560x1600 -> 2560 tokens (10240 patches): warm-up 1145 ms, median 1165.9 ms (0.46 ms/token)
+3000x3000 -> 4096 tokens (16384 patches): warm-up 2723 ms, median 2666.2 ms (0.65 ms/token)
+8000x100 -> 600 tokens (2400 patches): warm-up 141 ms, median 140.0 ms (0.23 ms/token)
