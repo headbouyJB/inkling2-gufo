@@ -1464,6 +1464,66 @@ typedef _Float16 v16h_a16 __attribute__((ext_vector_type(16), aligned(16)));
 typedef uint32_t v4u_a16 __attribute__((ext_vector_type(4), aligned(16)));
 typedef uint32_t v8u __attribute__((ext_vector_type(8)));
 
+// pack four floats into four halves in one 8 B register (the LDS half stores in the prefill
+// kernels were four separate 2 B stores per float4, which shows up as a 4-way bank conflict and
+// four instructions where one does)
+__device__ __forceinline__ uint64_t pack4h(float4 v) {
+  const uint64_t h0 = __builtin_bit_cast(uint16_t, (_Float16)v.x);
+  const uint64_t h1 = __builtin_bit_cast(uint16_t, (_Float16)v.y);
+  const uint64_t h2 = __builtin_bit_cast(uint16_t, (_Float16)v.z);
+  const uint64_t h3 = __builtin_bit_cast(uint16_t, (_Float16)v.w);
+  return h0 | (h1 << 16) | (h2 << 32) | (h3 << 48);
+}
+
+// k_ctl_apply_p with tensor cores. Same math as the SIMT version (out = x - tanh(Wf g64) x +
+// tanh(Wg g64) msg, K = 64) but the 2 304 x 64 gain/forget tiles are consumed as WMMA fragments:
+// the SIMT kernel moved ~10 MB of LDS per block for a 590 KFLOP/token operation, which is why it
+// sat at ~7 GFLOPS. Block: 32 tokens x 64 channels, 8 warps (4 row groups of 16 x 2 token tiles),
+// weights and activations staged as f16 in LDS (STR = 72 halves, no fragment bank conflicts).
+__global__ void __launch_bounds__(256) k_ctl_apply_w(CtlPJobs jobs, int T) {
+  constexpr int STR = 72, TT = 32, ROWS = 64;
+  const CtlPJob& p = jobs.j[blockIdx.z];
+  __shared__ _Float16 wg[ROWS][STR], wf[ROWS][STR];
+  __shared__ _Float16 gs[TT][STR];
+  const int tid = threadIdx.x, t0 = blockIdx.x * TT, c0 = blockIdx.y * ROWS;
+  const int lane = tid & 31, warp = tid >> 5, ln = lane & 15, hi = lane >> 4;
+  for (int i = tid; i < ROWS * 16; i += 256) {
+    const int row = i >> 4, c4 = i & 15;
+    const float4 a = *(const float4*)(p.gain + (size_t)(c0 + row) * 64 + c4 * 4);
+    const float4 b = *(const float4*)(p.forget + (size_t)(c0 + row) * 64 + c4 * 4);
+    *(uint64_t*)&wg[row][c4 * 4] = pack4h(a);   // one 8 B store, not four 2 B halves
+    *(uint64_t*)&wf[row][c4 * 4] = pack4h(b);
+  }
+  for (int i = tid; i < TT * 16; i += 256) {
+    const int tk = i >> 4, c4 = i & 15;
+    const int t = min(t0 + tk, T - 1);
+    *(uint64_t*)&gs[tk][c4 * 4] = pack4h(*(const float4*)(p.g64 + (size_t)t * 64 + c4 * 4));
+  }
+  __syncthreads();
+  const int rt = warp >> 1, tt = warp & 1;
+  v8f ga = {0, 0, 0, 0, 0, 0, 0, 0}, fo = ga;
+  const int rrow = rt * 16 + ln, trow = tt * 16 + ln;
+#pragma unroll
+  for (int ks = 0; ks < 4; ks++) {
+    const v16h_a16 bg = *(const v16h_a16*)&wg[rrow][ks * 16];
+    const v16h_a16 bf = *(const v16h_a16*)&wf[rrow][ks * 16];
+    const v16h_a16 av = *(const v16h_a16*)&gs[trow][ks * 16];
+    ga = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av, bg, ga);
+    fo = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av, bf, fo);
+  }
+  const int row = c0 + rrow;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const int t = t0 + tt * 16 + 2 * i + hi;
+    if (t < T) {
+      const float cv = p.x[(size_t)t * p.ldx + row];
+      p.out[(size_t)t * 2304 + row] =
+          cv - tanhf(fo[i]) * cv + tanhf(ga[i]) * p.msg[(size_t)t * p.ldm + row];
+    }
+  }
+}
+
+
 struct GP3 {
   const uint8_t* W;
   size_t wexp;
@@ -2338,7 +2398,8 @@ void CtlPrefill(hipStream_t s, const CtlPJobs& jobs, int t, float eps) {
     g.j[i] = {c.x, c.ldx, c.msg, c.ldm, c.down, 4608, 2304, 2304, 1, c.g64, 64, 0};
   }
   k_gate_p<<<dim3((t + kGateTT - 1) / kGateTT, 1, jobs.n), 512, 0, s>>>(g, t, eps);
-  k_ctl_apply_p<<<dim3((t + kCtlTT - 1) / kCtlTT, 36, jobs.n), 512, 0, s>>>(jobs, t);
+  if (t >= 32) k_ctl_apply_w<<<dim3((t + 31) / 32, 36, jobs.n), 256, 0, s>>>(jobs, t);
+  else k_ctl_apply_p<<<dim3((t + kCtlTT - 1) / kCtlTT, 36, jobs.n), 512, 0, s>>>(jobs, t);
   Chk("ctl_prefill");
 }
 
