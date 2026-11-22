@@ -5,7 +5,7 @@ A [Gufo](https://github.com/gufo-org/gufo) model extension that runs Inkling 2 M
 It provides text generation, tool calls, reasoning control, image input (`--mmproj`), prefix caching
 with RAM and disk checkpoints, and several concurrent sessions, all through `gufo serve`.
 
-Status: version 0.1.1, development builds only. It was developed and measured on one machine class,
+Status: version 0.1.2, development builds only. It was developed and measured on one machine class,
 a Ryzen AI MAX+ 395 (gfx1151, 128 GiB), against Gufo v0.35.0 (`0260e11`), extension API 0.3.x. Nothing
 here has been tested on other GPUs or other Gufo versions. The dev logs behind every number below are in
 [docs/dev/](docs/dev/) and in the kernel lab notes ([lab/RESULTS.md](lab/RESULTS.md)).
@@ -82,15 +82,15 @@ measure exactly the same thing (see the notes below the table).
 | prefill, 16K prompt (tok/s) | 1,308 | pp512 at 16K depth: 181.0; server needle test, 16K prompt: ~205 | pp512 at 16K depth: 258.0 |
 | prefill, 32K prompt (tok/s) | 1,253 | not measured | not measured |
 
-Batched decode, aggregate tok/s with one token per session per step (weights read once per step,
-logits bit-identical to running the sessions one at a time, verified at 64, 4,096 and 32,000 tokens of context for 2, 3 and 4 sessions; [docs/dev/M3-decode.md](docs/dev/M3-decode.md)):
+Batched decode, aggregate tok/s with one token per session per step (dense weights read once per step,
+logits bit-identical to running the sessions one at a time, verified at 64, 4,096 and 32,000 tokens of context for 2, 3 and 4 sessions). 0.1.2 build, one `inkling2_bench --ctxs 64,4096,32000 --decode 48 --ctx 32768 --batch 2,3,4` run (row 1 is that run; the extension column of the table above is the 0.1.1 measurement); [docs/dev/v012-batched.md](docs/dev/v012-batched.md) (0.1.1 figures and the design in [docs/dev/M3-decode.md](docs/dev/M3-decode.md)):
 
 | sessions | 64-token context | 4K context | 32K context |
 | --- | --- | --- | --- |
-| 1 | 44.9 | 42.3 | 36.0 |
-| 2 | 64.2 | 59.7 | 47.6 |
-| 3 | 73.2 | 66.5 | 52.8 |
-| 4 | 79.6 | 71.2 | 55.6 |
+| 1 | 44.7 | 42.2 | 35.8 |
+| 2 | 65.1 | 59.4 | 48.3 |
+| 3 | 76.3 | 69.1 | 55.1 |
+| 4 | 86.2 | 76.0 | 59.5 |
 <!-- /PERF-M3 -->
 
 Notes:
@@ -151,7 +151,7 @@ gufo extension install https://github.com/headbouyJB/inkling2-gufo@<commit> --ye
 gufo extension list
 ```
 
-`gufo extension list` should then show a line like `inkling2 0.1.1 [installed, ready]`. `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag).
+`gufo extension list` should then show a line like `inkling2 0.1.2 [installed, ready]`. `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag).
 
 `--yes` skips Gufo's confirmation prompt for unreviewed sources; read the source first (it is native code that runs with your permissions).
 
@@ -162,7 +162,7 @@ Gufo builds the module on your machine from the pinned source, so you also need 
 Gufo build as the `gufo` you run; Gufo refuses an SDK from another build. A Gufo without the SDK (for example the default Nix package) cannot build modules. Gufo's docs name the Nix `#sdk` / `#release-sdk` outputs and the `gufo-runtime` container as SDK-carrying alternatives; neither was tried with this extension. Otherwise use the in-tree route below.
 
 Verified: builds and installs as a module on a plain Gufo v0.35.0 source build with `GUFO_SDK_DIR=<build>/sdk`. The measurements in this README come from the in-tree build. Gufo marks modules as experimental (as of November 2026), so the commands may change.
-Served on the GPU (gfx1151) from the installed 0.1.1 module, with no in-tree copy built in: chat, concurrent requests, tool calls, image input, `UD-Q8_K_XL`, and Gufo's discovery, responses, stops, conversation, state-edges, prefill-scheduling and cache functional suites pass; four fixed prompts at temperature 0 give the same text as the in-tree build; and in two Gufo `compare.py` timing pairs no measurement was marked slower than the in-tree build (0 failed; 16 and 5 inconclusive), though neither pair qualified, because one disk-restore cache case varies from run to run on both builds. Details in [`docs/dev/module-test.md`](docs/dev/module-test.md).
+Served on the GPU (gfx1151) from the installed 0.1.1 module, with no in-tree copy built in: chat, concurrent requests, tool calls, image input, `UD-Q8_K_XL`, and Gufo's discovery, responses, stops, conversation, state-edges, prefill-scheduling and cache functional suites pass; four fixed prompts at temperature 0 give the same text as the in-tree build; and in two Gufo `compare.py` timing pairs no measurement was marked slower than the in-tree build (0 failed; 16 and 5 inconclusive), though neither pair qualified, because one disk-restore cache case varies from run to run on both builds. Details in [`docs/dev/module-test.md`](docs/dev/module-test.md). The 0.1.2 module was installed the same way and passed a served chat and tool-call smoke test ([`docs/dev/v012-batched.md`](docs/dev/v012-batched.md)).
 
 ### Build into Gufo (developer route)
 
@@ -304,6 +304,15 @@ Other limits:
 - Quality was measured as KL on 9,300 WikiText tokens and by suite results; there is no perplexity run through this engine and no
   benchmark of generated-text quality.
 - Only Gufo v0.35.0 was built with this extension. Gufo main (API 0.3.35) was read, not built.
+
+## Changes in 0.1.2
+
+- Batched decode: the routed-expert kernels now run the blocks of every (token, expert) pair for the same rows together, so
+  sessions that picked the same expert can read it from cache instead of memory again (inferred from the speed-up; not
+  measured directly). 4 sessions: 79.6 to 86.2 tok/s at short context, 71.2 to 76.0 at 4K, 55.6 to 59.5 at 32K (different runs;
+  the alternating old/new-order comparison on one build gives 79.7 to 86.1 and 71.2 to 75.9). Single-session decode and prefill are unchanged within
+  noise (0.6 % or less), and outputs are bit-identical to 0.1.1 ([docs/dev/v012-batched.md](docs/dev/v012-batched.md)).
+- Manifest version 0.1.2.
 
 ## Changes in 0.1.1
 

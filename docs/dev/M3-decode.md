@@ -107,7 +107,7 @@ kernels) to about 1.5 ms.
   step without the host argmax is 21.7 ms (46 tok/s). A realistic floor with perfect kernels is about 19 ms.
 * 32K context: the step grows by 5.5 ms; the 8 global-attention visits read 1.07 GB of f16 KV (4.7 ms at 230 GB/s). Only a smaller KV
   (q8) lowers that, which changes the state format and numerics; not attempted.
-* Batched: MoE bytes dominate (four tokens read 4 x 1.57 GB of experts); the dense part is shared. B = 4 is 1.78x of B = 1 aggregate.
+* Batched: MoE bytes dominate (four tokens read 4 x 1.57 GB of experts); the dense part is shared. B = 4 is 1.79x of B = 1 aggregate (79.8 / 44.7, table above). (0.1.2 changes the routed-expert block order so experts shared within a step can be served from cache: B = 4 is 1.93x at 64-token context; see `v012-batched.md`.)
 
 ## Commands
 

@@ -57,7 +57,7 @@ c() {
 
 ```sh
 gufo extension install https://github.com/headbouyJB/inkling2-gufo@<commit> --yes
-gufo extension list      # expect a line like: inkling2 0.1.1 [installed, ready]
+gufo extension list      # expect a line like: inkling2 0.1.2 [installed, ready]
 ```
 
 `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag). Gufo builds the module on your machine from that pinned source
@@ -72,7 +72,7 @@ toolchain that built that Gufo: CMake 3.27 or newer, Ninja, the same C, C++ and 
 Git. A Gufo without the SDK (for example the default Nix package) cannot build modules. Gufo's docs name the Nix `#sdk` / `#release-sdk` outputs and the `gufo-runtime` container as SDK-carrying alternatives; neither was tried with this extension. Otherwise use the developer routes below (sections 1 to 3).
 
 Verified: builds and installs as a module on a plain Gufo v0.35.0 source build with `GUFO_SDK_DIR=<build>/sdk`. The measurements in the README come from the in-tree build. Gufo marks modules as experimental (as of November 2026), so the commands may change.
-Served on the GPU (gfx1151) from the installed 0.1.1 module, with no in-tree copy built in: chat, concurrent requests, tool calls, image input, `UD-Q8_K_XL`, and Gufo's discovery, responses, stops, conversation, state-edges, prefill-scheduling and cache functional suites pass; four fixed prompts at temperature 0 give the same text as the in-tree build; and in two Gufo `compare.py` timing pairs no measurement was marked slower than the in-tree build (0 failed; 16 and 5 inconclusive), though neither pair qualified, because one disk-restore cache case varies from run to run on both builds. Details in [`docs/dev/module-test.md`](docs/dev/module-test.md).
+Served on the GPU (gfx1151) from the installed 0.1.1 module, with no in-tree copy built in: chat, concurrent requests, tool calls, image input, `UD-Q8_K_XL`, and Gufo's discovery, responses, stops, conversation, state-edges, prefill-scheduling and cache functional suites pass; four fixed prompts at temperature 0 give the same text as the in-tree build; and in two Gufo `compare.py` timing pairs no measurement was marked slower than the in-tree build (0 failed; 16 and 5 inconclusive), though neither pair qualified, because one disk-restore cache case varies from run to run on both builds. Details in [`docs/dev/module-test.md`](docs/dev/module-test.md). The 0.1.2 module was installed the same way and passed a served chat and tool-call smoke test ([`docs/dev/v012-batched.md`](docs/dev/v012-batched.md)).
 
 After a Gufo upgrade `gufo extension list` shows
 `needs update` until you run `gufo extension update`.

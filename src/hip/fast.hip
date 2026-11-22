@@ -441,7 +441,9 @@ __global__ void __launch_bounds__(BW * WS)
   constexpr int NU = K / Fm<FMT>::UEL, CPU = Fm<FMT>::UEL / 16, RPP = WS / LPR / 2;
   __shared__ v4u aq[2 * CPU * NU];
   __shared__ float asc[2 * (K / 16)];
-  int p = blockIdx.y;
+  // Grid x is the (token, expert) assignment and y the row block, so the blocks of different tokens that chose the
+  // same expert read its rows at about the same time (cache hits instead of a second DRAM read).
+  const int p = blockIdx.x, rbk = blockIdx.y;
   quant_act<K, 1, Fm<FMT>::UEL>(x + (size_t)(p >> 3) * K, aq, asc, res);
   int e = ids[p];
   float sc = escale ? escale[e] : 1.f;
@@ -449,7 +451,7 @@ __global__ void __launch_bounds__(BW * WS)
   const uint8_t* We = W + (size_t)e * 2 * FF * rb;
   int wave = threadIdx.x / WS, lane = threadIdx.x % WS, g = lane / LPR, lir = lane % LPR,
       isup = g & 1, pg = g >> 1;
-  int base = (blockIdx.x * BW + wave) * RPP * NIT;
+  int base = (rbk * BW + wave) * RPP * NIT;
 #pragma unroll
   for (int it = 0; it < NIT; it++) {
     int j = base + it * RPP + pg;
@@ -509,13 +511,13 @@ __global__ void __launch_bounds__(BW * WS)
   constexpr int NU = K / Fm<FMT>::UEL, CPU = Fm<FMT>::UEL / 16, RPW = WS / LPR;
   __shared__ v4u aq[2 * CPU * NU];
   __shared__ float asc[2 * (K / 16)];
-  const int p = blockIdx.y;  // token * 8 + slot
+  const int p = blockIdx.x, rbk = blockIdx.y;  // assignment (token * 8 + slot) first, as in k_moe_gu
   quant_act<K, 1, Fm<FMT>::UEL>(a + (size_t)p * K, aq, asc, res);
   const int e = ids[p];
   const float ew = wts[p] * (escale ? escale[e] : 1.f);
   size_t rb = (size_t)NU * Fm<FMT>::BYTES;
   int wave = threadIdx.x / WS, lane = threadIdx.x % WS, g = lane / LPR, lir = lane % LPR;
-  int base = (blockIdx.x * BW + wave) * RPW * NIT;
+  int base = (rbk * BW + wave) * RPW * NIT;
 #pragma unroll
   for (int it = 0; it < NIT; it++) {
     int row = base + it * RPW + g;
@@ -1900,7 +1902,7 @@ void MoeGu(hipStream_t s, int fmt, const void* w, const float* escale, const flo
                   BW = decltype(bw)::value;
     constexpr int RPB = BW * (WS / LPR / 2) * NIT;
     k_moe_gu<FM, 2304, LPR, NIT, BW>
-        <<<dim3((ff + RPB - 1) / RPB, 8 * nb), BW * WS, 0, s>>>(W, escale, x, ids, a, ff, beta, lb, g_res);
+        <<<dim3(8 * nb, (ff + RPB - 1) / RPB), BW * WS, 0, s>>>(W, escale, x, ids, a, ff, beta, lb, g_res);
   };
   if (fmt == kFmtNvfp4) {
     switch (g_tune[1]) {
@@ -1949,7 +1951,7 @@ void MoeDownE(hipStream_t s, int fmt, const void* w, const float* escale, const 
                   BW = decltype(bw)::value;
     constexpr int RPB = BW * (WS / LPR) * NIT;
     k_moe_down_e<FM, 1152, LPR, NIT, BW>
-        <<<dim3((d + RPB - 1) / RPB, 8 * nb), BW * WS, 0, s>>>(W, escale, a, ids, wts, yp, d, g_res);
+        <<<dim3(8 * nb, (d + RPB - 1) / RPB), BW * WS, 0, s>>>(W, escale, a, ids, wts, yp, d, g_res);
   };
   if (fmt == kFmtNvfp4) {
     switch (g_tune[2]) {
