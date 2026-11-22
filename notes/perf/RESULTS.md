@@ -38,7 +38,23 @@ and 1 357 → 1 420 tok/s through the server.
 
 ## Why the two targets were not reached
 
-### Decode 100 tok/s: not reachable on this file
+### Decode 100 tok/s: not reachable on this file, and not with a drafter either
+
+Measured decode-step cost for a *verify batch* on this box (`inkling2_bench --batch 2,3,4`), which
+is the exact cost model for speculative decoding:
+
+| verify width | ms/step | aggregate tok/s at 100 % acceptance |
+| --- | --- | --- |
+| 1 (today) | 22.98 | 43.5 |
+| 2 | 31.33 | 63.8 |
+| 3 | 37.54 | 79.9 |
+| 4 (the extension's max) | 43.49 | **92.0** |
+
+So even if a drafter proposed 3 tokens per round and **all** of them were accepted **every** round,
+and the drafter itself were free, single-session decode could not exceed 92 tok/s; with the
+drafter's ~10 ms per round and a realistic 75 % acceptance it is ~56 tok/s. 100 tok/s is above the
+hardware's 4-token-verify ceiling.
+
 
 A decode step reads **3.99 GB of weights** (MoE 1.58 GB, dense projections + o-proj 1.37 GB,
 lm_head 0.49 GB, controllers + router 0.28 GB) in 23.4 ms — 170 GB/s end to end. The DRAM ceiling
