@@ -5,17 +5,17 @@ branches are on `github.com/vincentkelleher/inkling2-gufo`.
 
 ## Headline
 
-| metric | baseline 8bb6cd5 | final 92e17e0 | target | target met |
+| metric | baseline 8bb6cd5 | final 08db724 | target | target met |
 | --- | --- | --- | --- | --- |
-| e2e prefill 4k (`:5830`) | 1 357 tok/s | **1 473 tok/s** (+8.5 %) | 2 000 | no (74 %) |
-| e2e prefill 16k | 1 372 tok/s | **1 470 tok/s** (+7.2 %) | 2 000 | no (74 %) |
-| e2e decode 1k ctx | 45.1 tok/s | 45.0 tok/s (±noise) | 100 | no (45 %) |
+| e2e prefill 4k (`:5830`) | 1 357 tok/s | **1 523 tok/s** (+12.3 %) | 2 000 | no (76 %) |
+| e2e prefill 16k | 1 372 tok/s | **1 545 tok/s** (+12.6 %) | 2 000 | no (77 %) |
+| e2e decode 1k ctx | 45.1 tok/s | 44.7 tok/s (±noise) | 100 | no (45 %) |
 | e2e decode 16k ctx | 41.1 tok/s | 41.0 tok/s | 100 | no (41 %) |
-| e2e batched decode, 2 sessions | 68.8 tok/s agg | 69.6 tok/s agg | — | — |
-| short-context decode (`test-serve.sh`) | 46.9 tok/s | 46.8 tok/s | — | — |
-| in-process prefill (`inkling2_bench`, 4k) | 1 447 tok/s | **1 554 tok/s** (+7.4 %) | 2 000 | no |
-| in-process prefill per token (trace) | 692.5 us | **652.3 us** (−5.8 %) | 500 | no |
-| model quality vs baseline | — | meanKL 0.000, top1 100 % | ≤1e-3 KL | yes |
+| e2e batched decode, 2 sessions | 68.8 tok/s agg | 68.3 tok/s agg | — | — |
+| short-context decode (`test-serve.sh`) | 46.9 tok/s | 46.9 tok/s | — | — |
+| in-process prefill (`inkling2_bench`, 4k) | 1 447 tok/s | **1 641 tok/s** (+13.4 %) | 2 000 | no |
+| in-process prefill per token (trace) | 692.5 us | **621.0 us** (−10.3 %) | 500 | no |
+| model quality vs baseline | — | meanKL 1.1e-4, top1 100 % | ≤1e-3 KL | yes |
 | `test-serve.sh` (chat, decode, tools, image, cache) | pass | pass | — | yes |
 
 Every number is 2 reps per case with the spread recorded in the JSON files
@@ -56,9 +56,10 @@ Not implemented; the 1 200–1 800 line inventory is in that note.
 
 ### Prefill 2 000 tok/s: 28 % short, and the remaining costs are structural
 
-Per-token budget now (2 048-token ubatch, rocprofv3): MoE GEMMs 243 us, dense GEMMs 118 us,
-`k_ctl_apply_p` 78, `k_gate_p` 64, `mix_k` 32, `attn_prefill` 29, `k_sum_pairs` 18.5, conversion /
-norms / conv / copies ~55.
+Per-token budget now (2 048-token ubatch, rocprofv3, 621 us total): MoE gate+up 170 + MoE down 90,
+dense GEMMs 75 + o-proj 29 + lm_head 17, `k_ctl_apply_w` 34, `mix_k` 32, `attn_prefill` 30,
+`k_gate_p` 26 + `k_gate_wh` 26, `k_sum_pairs` 18, conversion / norms / conv / copies ~50.
+GEMMs are 61 % of the token and run at ~24 TFLOPS of a 55 TFLOPS f16 peak.
 
 * The GEMMs run at ~25 TFLOPS of the 55 TFLOPS f16 WMMA peak (45 %). Trying to raise it by tile
   width failed (see rejected list); the lab's own H2–H4 notes already concluded that bigger wave
@@ -77,7 +78,7 @@ norms / conv / copies ~55.
 | `INKLING2_TUNE` gu variants 1–5, down_e 11/13/16/19/21, proj 2/3 | 42.4–43.9 tok/s decode, best +0.8 % (noise); defaults already best |
 | `INKLING2_ACT_FAST=1` (drop the activation-residual int8 plane) | decode 44.3 vs 43.6 (+1.6 %), but it changes activation numerics — not worth it for 1.6 % |
 | LDS `float4` on `k_ctl_apply_p` | no change (kernel is not LDS-instruction bound any more) |
-| f16 WMMA for the skinny F32 GEMMs (`k_gate_w`: router, controller down-projection, sink) | prefill **1 636 tok/s** (+5.4 %) but mean KL **1.38–1.48e-3** — over the 1e-3 guardrail; reverted, numbers kept in `prefill-wmma-ctl.md` |
+| f16 WMMA for the router and sink GEMMs (`k_gate_w`) | prefill **1 618–1 636 tok/s** but mean KL **1.6–1.7e-3** — over the guardrail with f16 *and* with split-f16 operands, because both consumers are discrete (router top-8, attention scores): the damage is the changed summation order, not the precision. Kept F32; see `prefill-wmma-gate.md` |
 
 ## Reproducing
 
@@ -98,6 +99,8 @@ EXT_DIR=~/Source/inkling2-gufo EXT_REV=92e17e0 ./build-gufo-inkling.sh   # -> lo
 | `perf/map` | `tools/prof_stage.py`, the per-stage time map, headroom analysis |
 | `perf/prefill-ctl-tile` | `k_ctl_apply_p` 32-token blocks (−16 % on the kernel) |
 | `perf/prefill-lds-float4` | transposed `float4` LDS tiles + `k_gate_p` 32-token blocks |
-| `perf/prefill-wmma-ctl` | f16 WMMA `k_ctl_apply_w` (78 → 52 us/token, meanKL 1.8e-4); +7.4 % prefill overall |
+| `perf/prefill-wmma-ctl` | f16 WMMA `k_ctl_apply_w` (78 → 52 us/token, meanKL 1.8e-4) |
+| `perf/prefill-wmma-gate` | split-f16 WMMA for the controller down-projection (KL 1.1e-4, +2 %) |
+| `perf/prefill-wmma-ctl128` | 128-token tiles in `k_ctl_apply_w` (52 → 34 us/token, +3.5 %) |
 | `perf/dspark-feasibility` | verified drafter GGUF, round-cost model, implementation inventory |
 | `perf/report` | this file |
