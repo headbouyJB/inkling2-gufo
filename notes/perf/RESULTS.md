@@ -5,16 +5,16 @@ branches are on `github.com/vincentkelleher/inkling2-gufo`.
 
 ## Headline
 
-| metric | baseline 8bb6cd5 | final 7217315 | target | target met |
+| metric | baseline 8bb6cd5 | final 92e17e0 | target | target met |
 | --- | --- | --- | --- | --- |
-| e2e prefill 4k (`:5830`) | 1 357 tok/s | **1 420 tok/s** (+4.6 %) | 2 000 | no (71 %) |
-| e2e prefill 16k | 1 372 tok/s | **1 417 tok/s** (+3.3 %) | 2 000 | no (71 %) |
-| e2e decode 1k ctx | 45.1 tok/s | 44.7 tok/s (±noise) | 100 | no (45 %) |
-| e2e decode 16k ctx | 41.1 tok/s | 40.8 tok/s | 100 | no (41 %) |
-| e2e batched decode, 2 sessions | 68.8 tok/s agg | 68.7 tok/s agg | — | — |
-| short-context decode (`test-serve.sh`) | 46.9 tok/s | 46.9 tok/s | — | — |
-| in-process prefill (`inkling2_bench`, 4k) | 1 447 tok/s | **1 500–1 512 tok/s** | 2 000 | no |
-| in-process prefill per token (trace) | 692.5 us | **654.8 us** (−5.4 %) | 500 | no |
+| e2e prefill 4k (`:5830`) | 1 357 tok/s | **1 473 tok/s** (+8.5 %) | 2 000 | no (74 %) |
+| e2e prefill 16k | 1 372 tok/s | **1 470 tok/s** (+7.2 %) | 2 000 | no (74 %) |
+| e2e decode 1k ctx | 45.1 tok/s | 45.0 tok/s (±noise) | 100 | no (45 %) |
+| e2e decode 16k ctx | 41.1 tok/s | 41.0 tok/s | 100 | no (41 %) |
+| e2e batched decode, 2 sessions | 68.8 tok/s agg | 69.6 tok/s agg | — | — |
+| short-context decode (`test-serve.sh`) | 46.9 tok/s | 46.8 tok/s | — | — |
+| in-process prefill (`inkling2_bench`, 4k) | 1 447 tok/s | **1 554 tok/s** (+7.4 %) | 2 000 | no |
+| in-process prefill per token (trace) | 692.5 us | **652.3 us** (−5.8 %) | 500 | no |
 | model quality vs baseline | — | meanKL 0.000, top1 100 % | ≤1e-3 KL | yes |
 | `test-serve.sh` (chat, decode, tools, image, cache) | pass | pass | — | yes |
 
@@ -77,6 +77,7 @@ norms / conv / copies ~55.
 | `INKLING2_TUNE` gu variants 1–5, down_e 11/13/16/19/21, proj 2/3 | 42.4–43.9 tok/s decode, best +0.8 % (noise); defaults already best |
 | `INKLING2_ACT_FAST=1` (drop the activation-residual int8 plane) | decode 44.3 vs 43.6 (+1.6 %), but it changes activation numerics — not worth it for 1.6 % |
 | LDS `float4` on `k_ctl_apply_p` | no change (kernel is not LDS-instruction bound any more) |
+| f16 WMMA for the skinny F32 GEMMs (`k_gate_w`: router, controller down-projection, sink) | prefill **1 636 tok/s** (+5.4 %) but mean KL **1.38–1.48e-3** — over the 1e-3 guardrail; reverted, numbers kept in `prefill-wmma-ctl.md` |
 
 ## Reproducing
 
@@ -84,7 +85,7 @@ Dev build (GPU, `BUILD_TESTING=ON`) and the trace commands are in [`map.md`](map
 that produced the final numbers:
 
 ```sh
-EXT_DIR=~/Source/inkling2-gufo EXT_REV=7217315 ./build-gufo-inkling.sh   # -> localhost/gufo-runtime:inkling2
+EXT_DIR=~/Source/inkling2-gufo EXT_REV=92e17e0 ./build-gufo-inkling.sh   # -> localhost/gufo-runtime:inkling2
 ./serve-standalone.sh && tests/perf/bench.py --reps 2 --out notes/perf/final-standalone.json
 ./test-serve.sh
 ```
@@ -96,6 +97,7 @@ EXT_DIR=~/Source/inkling2-gufo EXT_REV=7217315 ./build-gufo-inkling.sh   # -> lo
 | `perf/baseline` | `tests/perf/bench.py`, baseline rows (standalone + llama-swap) |
 | `perf/map` | `tools/prof_stage.py`, the per-stage time map, headroom analysis |
 | `perf/prefill-ctl-tile` | `k_ctl_apply_p` 32-token blocks (−16 % on the kernel) |
-| `perf/prefill-lds-float4` | transposed `float4` LDS tiles + `k_gate_p` 32-token blocks (−5.4 % prefill overall) |
+| `perf/prefill-lds-float4` | transposed `float4` LDS tiles + `k_gate_p` 32-token blocks |
+| `perf/prefill-wmma-ctl` | f16 WMMA `k_ctl_apply_w` (78 → 52 us/token, meanKL 1.8e-4); +7.4 % prefill overall |
 | `perf/dspark-feasibility` | verified drafter GGUF, round-cost model, implementation inventory |
 | `perf/report` | this file |
