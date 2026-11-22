@@ -305,6 +305,12 @@ Other limits:
   benchmark of generated-text quality.
 - Only Gufo v0.35.0 was built with this extension. Gufo main (API 0.3.35) was read, not built.
 
+## Unreleased
+
+- Prefill: the loop-controller and router kernels cover 32 tokens per block and read whole rows; served prefill +15 to 17 %
+  (2.3K prompt 1,304 to 1,503 tok/s, 17K prompt 1,332 to 1,557 tok/s), decode unchanged, outputs bit-identical
+  ([docs/dev/prefill-ctl.md](docs/dev/prefill-ctl.md)). The performance tables above still show 0.1.2.
+
 ## Changes in 0.1.2
 
 - Batched decode: the routed-expert kernels now run the blocks of every (token, expert) pair for the same rows together, so
