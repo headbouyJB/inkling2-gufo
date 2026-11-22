@@ -5,7 +5,7 @@ A [Gufo](https://github.com/gufo-org/gufo) model extension that runs Inkling 2 M
 It provides text generation, tool calls, reasoning control, image input (`--mmproj`), prefix caching
 with RAM and disk checkpoints, and several concurrent sessions, all through `gufo serve`.
 
-Status: version 0.1.0, development builds only. It was developed and measured on one machine class,
+Status: version 0.1.1, development builds only. It was developed and measured on one machine class,
 a Ryzen AI MAX+ 395 (gfx1151, 128 GiB), against Gufo v0.35.0 (`0260e11`), extension API 0.3.x. Nothing
 here has been tested on other GPUs or other Gufo versions. The dev logs behind every number below are in
 [docs/dev/](docs/dev/) and in the kernel lab notes ([lab/RESULTS.md](lab/RESULTS.md)).
@@ -144,12 +144,35 @@ The evidence is six synthetic images, not a photo or OCR benchmark. Details are 
 
 ## Build and install
 
+### Install as a module (primary route)
+
+```sh
+gufo extension install https://github.com/headbouyJB/inkling2-gufo@<commit> --yes
+gufo extension list
+```
+
+`gufo extension list` should then show a line like `inkling2 0.1.1 [installed, ready]`. `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag).
+
+`--yes` skips Gufo's confirmation prompt for unreviewed sources; read the source first (it is native code that runs with your permissions).
+
+This needs a Gufo build that ships the extension SDK: a source build tree's `sdk/` directory (or
+`<prefix>/lib/gufo/sdk` after installing it), or an SDK elsewhere that you point Gufo at with `GUFO_SDK_DIR`.
+Gufo builds the module on your machine from the pinned source, so you also need the toolchain that built your Gufo
+(CMake 3.27 or newer, Ninja, the same C, C++ and HIP compilers, the ROCm libraries, and Git). The SDK must belong to the same
+Gufo build as the `gufo` you run; Gufo refuses an SDK from another build. A Gufo without the SDK (for example the default Nix package) cannot build modules. Gufo's docs name the Nix `#sdk` / `#release-sdk` outputs and the `gufo-runtime` container as SDK-carrying alternatives; neither was tried with this extension. Otherwise use the in-tree route below.
+
+Verified: builds and installs as a module on a plain Gufo v0.35.0 source build with `GUFO_SDK_DIR=<build>/sdk`. The measurements in this README come from the in-tree build. Gufo marks modules as experimental (as of November 2026), so the commands may change.
+Served on the GPU (gfx1151) from the installed 0.1.1 module, with no in-tree copy built in: chat, concurrent requests, tool calls, image input, `UD-Q8_K_XL`, and Gufo's discovery, responses, stops, conversation, state-edges, prefill-scheduling and cache functional suites pass; four fixed prompts at temperature 0 give the same text as the in-tree build; and in two Gufo `compare.py` timing pairs no measurement was marked slower than the in-tree build (0 failed; 16 and 5 inconclusive), though neither pair qualified, because one disk-restore cache case varies from run to run on both builds. Details in [`docs/dev/module-test.md`](docs/dev/module-test.md).
+
+### Build into Gufo (developer route)
+
 Prerequisites: a Gufo v0.35.0 source checkout (`0260e11`), Nix (the documented Gufo route; the build runs inside
 a `nixos/nix` container with podman), ROCm for gfx1151 on the host, and about 20 minutes for the first full build.
 
 Full instructions, including the CPU unit tests and an incremental development loop, are in [BUILD.md](BUILD.md).
 In short, `flake.nix` pins Gufo and builds it with this extension attached (`override { extensions = [ self ]; }`), so
-`nix build` gives a `gufo` binary that knows about `inkling2`. Check with `gufo diagnose --section extensions`.
+`nix build` gives a `gufo` binary that knows about `inkling2`, and BUILD.md also describes pointing a Gufo
+build tree at this directory with `GUFO_EXTENSION_DIRS`. Check with `gufo diagnose --section extensions`.
 
 ## Running
 
@@ -170,8 +193,7 @@ gufo serve llm \
 - The GPU container needs `/dev/kfd`, `/dev/dri`, `--ulimit memlock=-1:-1`; see BUILD.md section 3.
 - Chat, Responses and Messages endpoints, tool calls, `reasoning_effort` and `enable_thinking` are handled by Gufo with the
   extension's template and parser. The server requires a request-level `model` and accepts exactly the id it lists in `/v1/models`, which is `inkling-2-mini` (`inkling2` and a missing `model` are refused with 404 and 400); this is also the id in `extension.json`. Example: `curl -s http://127.0.0.1:5830/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "inkling-2-mini", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 64}'`.
-- Optional environment switches (debugging and tuning): `INKLING2_UBATCH` (multiple of 16 from 256 to 4096, default 2048; other values are refused at load), `INKLING2_NOGRAPH`,
-  `INKLING2_SLOWDECODE`, `INKLING2_SLOWPREFILL`, `INKLING2_ACT_FAST`, `INKLING2_VISION_LOG`.
+- Environment switches (all optional; debugging and tuning only, except where marked) are listed in [Environment switches](#environment-switches).
 
 ### Reasoning
 
@@ -181,6 +203,58 @@ Inkling's chat template maps effort names to numbers (`none` 0, `minimal` 0.1, `
 decoding the reasoning text is the same from `minimal` to `medium`, `high` to `max` only lengthen it on some prompts, and
 the length is not monotonic in effort. Effort 0 does not stop the model from opening a thinking block, so
 "reasoning off" (`enable_thinking: false` or `reasoning_effort: none`) is implemented by the extension, not by the template.
+
+## Environment switches
+
+Every environment variable that the code, tests and tools read. None is needed for normal use. "Engine" means the
+inkling2 engine, which runs inside `gufo serve` and also inside the `inkling2_bench`, `inkling2_oracle`, `inkling2_image_oracle` and `inkling2_cache_test` binaries that link it. Most engine switches are presence switches: on when the variable is set to any value, including `0` or an empty string. `INKLING2_DOWN_E`, `INKLING2_PF_*`, `INKLING2_TUNE` and `INKLING2_UBATCH` read their value instead; `INKLING2_VISION_TAP`, `INKLING2_TEST_GGUF` and the oracle variables take a path or number.
+The engine switches are read when the engine is created (model load), not per request (`INKLING2_VISION_LOG` is checked for each image).
+
+| Variable | Read by | What it does | Default | Use |
+| --- | --- | --- | --- | --- |
+| `INKLING2_UBATCH` | engine (`src/engine.cpp`) | prefill micro-batch size in tokens. Must be a multiple of 16 from 256 to 4096; any other value (or a non-number) makes the model load fail with an error. It is part of the checkpoint identity, so cache checkpoints written under another value are not restored | 2048 | tuning |
+| `INKLING2_NOGRAPH` | engine | decode runs as individual kernel launches instead of a captured HIP graph | graph on | debug |
+| `INKLING2_SLOWDECODE` | engine | disables the fast decode kernels (generic path) | fast kernels on | debug (also in checkpoint identity) |
+| `INKLING2_SLOWPREFILL` | engine | disables the fast prefill path (generic path) | fast prefill on | debug (also in checkpoint identity) |
+| `INKLING2_ACT_FAST` | engine | drops the second int8 plane (quantisation residual) of the activations in the fast GEMVs: faster, slightly different numerics (see Quality) | off | tuning (also in checkpoint identity) |
+| `INKLING2_CTL_F32` | engine | keeps the loop-controller and router weights as F32 in decode; otherwise decode uses F16 copies | F16 copies | debug (also in checkpoint identity) |
+| `INKLING2_DOWN_E` | engine | `0` selects the older MoE down kernel (one block row per token); any non-zero number keeps the default (one block row per token and expert); decode only | 1 | debug (also in checkpoint identity) |
+| `INKLING2_TUNE` | engine | `p,g,d`: kernel-shape variant indices for the projection, gate/up and down GEMVs (`SetTune` in `src/hip/fast.hip`) | 0,0,0 | tuning (also in checkpoint identity) |
+| `INKLING2_NOBATCH` | engine | batched decode runs the sessions one after another | batched | debug |
+| `INKLING2_PF_PROJ_MB` | engine | (decode) MALL warm-up: size in MiB of the next layer's projection weights that a side stream sweeps during small dependent kernels. `0` or unset turns it off | off | tuning |
+| `INKLING2_PF_OPROJ_MB` | engine | parsed like `INKLING2_PF_PROJ_MB` but the value is never used (see below) | off | no effect |
+| `INKLING2_PF_BLOCKS` | engine | thread blocks used by the warm-up sweep; only matters with `INKLING2_PF_PROJ_MB` | 32 | tuning |
+| `INKLING2_PROFILE` | engine | per-section GPU time of the decode step, printed to stderr every 20 steps; only active together with `INKLING2_NOGRAPH` | off | debug |
+| `INKLING2_PROFILE_PREFILL` | engine | per-section GPU time of each prefill micro-batch, printed to stderr (a running average, one line per micro-batch; synchronises the stream) | off | debug |
+| `INKLING2_DBG_DBL` | engine | runs the fast projection GEMV a second time on the same input in each layer (a debug check on that kernel; slows decode) | off | debug |
+| `INKLING2_DBG_TAP` | engine | prints `TAP ...` lines (layer-output checksum per visit and token) to stderr; only active together with `INKLING2_NOGRAPH`. Does not write files | off | debug |
+| `INKLING2_VISION_LOG` | engine (`src/runner.cpp`); also set by `tests/vision/serve-inner.sh` | logs image size, rows and encode time to stderr for every image | off | debug |
+| `INKLING2_VISION_TAP` | vision encoder (`src/vision/vision_encoder.hip`), so the server, and the `vision_test` and `inkling2_image_oracle` test programs | **writes files**: dumps the activations after each encoder stage as `<stage>.bin` (float32, 16-byte header of four ints, then rows x cols) into this directory. The directory must already exist; files are overwritten, and the dump synchronises the stream after every stage. A debug aid for comparing against the llama.cpp-side oracle | off | debug only |
+| `INKLING2_TEST_GGUF` | `inkling2_text_tests` (`tests/text/text_tests.cpp`) | path of an Inkling 2 GGUF to read the tokenizer from; tests are skipped if it cannot be loaded | `Inkling-2-Mini-UD-Q4_K_XL.gguf_file` in the working directory | tests |
+| `LLAMA_DUMP_NGL` | `llama_dump` (`tests/oracle/llama_dump.cpp`, built against llama.cpp) | layers offloaded to the GPU backend; `0` is the exact CPU oracle | 0 | oracle |
+| `MTMD_TAP` | `mtmd_dump` (llama.cpp side) | **writes files**: dumps the named intermediate vision tensors as `.bin` into this directory, which must already exist (the counterpart of `INKLING2_VISION_TAP`) | off | oracle |
+| `MTMD_FA_OFF` | `mtmd_dump` (llama.cpp side) | uses F32 attention in the oracle instead of flash attention | off | oracle |
+| `MTMD_VISION_CPU` | `mtmd_logits` (llama.cpp side) | runs the projector on the CPU and the text model on the GPU | off | oracle |
+| `MTMD_IDS_OUT` | `mtmd_logits` | **writes a file**: the token ids of the text chunks (`-1` marks image rows) | off | oracle |
+| `MTMD_NBATCH` | `mtmd_logits` | sets n_batch and n_ubatch | 2048 | oracle |
+| `MTMD_APPEND_IDS` | `mtmd_logits` | file of token ids to teacher-force after the prompt | off | oracle |
+| `MTMD_GEN` | `mtmd_logits` | continue greedily for up to N tokens and print `GEN: <text>` | off | oracle |
+| `MTMD_GEN_PAST` | `mtmd_logits` | do not stop at `<|end_message|>` while generating | off | oracle |
+
+`INKLING2_PF_OPROJ_MB` looks dead: `src/engine.cpp` stores the value in `pf_oproj_bytes`, and nothing reads that field.
+It is kept because deleting it changes nothing; do not rely on it. `INKLING2_SLOWPREFILL`, `INKLING2_SLOWDECODE`,
+`INKLING2_ACT_FAST`, `INKLING2_CTL_F32`, `INKLING2_DOWN_E` and `INKLING2_TUNE` change the numerics, so they are recorded in the
+checkpoint identity; a checkpoint written under one setting is not restored under another.
+
+Variables of the helper scripts (see [BUILD.md](BUILD.md) for the first group; none is read by the server):
+
+| Variable | Read by | Meaning | Default |
+| --- | --- | --- | --- |
+| `WORK_ROOT`, `MODEL_DIR`, `CORPUS_DIR`, `SRC_DIR`, `GUFO_SRC`, `FCLIENT_VENV`, `GPU_RUN`, `EXT_SRC`, `LLAMA_CPP_SRC`, `CXX`, `ROCM_PATH` | `tools/*.sh`, `tests/vision/*.sh`, `lab/build.sh`, `lab/attn/build.sh` | locations and toolchain; see the table in BUILD.md | under `$HOME`, see BUILD.md |
+| `INKLING2_*` (any) | `tools/gufo-wrap.sh` | every `INKLING2_` variable of the caller is passed into the container | none |
+| `MODEL`, `CONTEXT`, `SESSIONS`, `PORT`, `LOG`, `EXTRA`, `RUNARGS`, `W` | `tools/functional*.sh`, `tests/vision/functional-v.sh`, `tools/serve-inner*.sh`, `tools/sessions-smoke.sh`, `tools/disk-smoke.sh`, `tools/oracle-run.sh` | model path, `--context`, `--sessions`, port, log label, extra `gufo serve` or `run.py` arguments (`EXTRA` in `lab/build.sh` and `lab/attn/build.sh` is extra hipcc flags), work dir; each script's header lists the ones it takes | per script |
+| `ENVARG`, `GUFO`, `PYTHON`, `CLIENT_ARGS`, `CTX`, `NOMM`, `MODELS`, `REF`, `OUT`, `SRC` | one script each (`tools/serve-inner-r.sh`, `tools/sessions-smoke.sh`, `tests/vision/serve-inner.sh`, `tests/vision/run_oracle_compare.sh`, `tools/oracle-run.sh`, `lab/build.sh`) | one `NAME=value` container variable, the `gufo` binary, the Python interpreter, extra client arguments, context, no-mmproj switch, model directory, reference file, output and source file | per script |
+| `DBG`, `UONLY`, `FMTONLY` | `lab/*.cpp` kernel lab binaries | extra debug print and kernel-variant filters in the standalone lab programs (not part of the extension) | off |
 
 ## Deliberate deviations from the official chat template
 
@@ -230,6 +304,12 @@ Other limits:
 - Quality was measured as KL on 9,300 WikiText tokens and by suite results; there is no perplexity run through this engine and no
   benchmark of generated-text quality.
 - Only Gufo v0.35.0 was built with this extension. Gufo main (API 0.3.35) was read, not built.
+
+## Changes in 0.1.1
+
+- `VISION_TAP` is now `INKLING2_VISION_TAP` (same behaviour).
+- README: environment switch reference, module-install route.
+- Manifest version 0.1.1; no engine, kernel or measurement changes.
 
 ## Repository layout
 

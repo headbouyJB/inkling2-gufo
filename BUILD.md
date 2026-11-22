@@ -53,6 +53,32 @@ c() {
 }
 ```
 
+## 0. Install as a module (primary route for users)
+
+```sh
+gufo extension install https://github.com/headbouyJB/inkling2-gufo@<commit> --yes
+gufo extension list      # expect a line like: inkling2 0.1.1 [installed, ready]
+```
+
+`<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag). Gufo builds the module on your machine from that pinned source
+and keeps it under `$GUFO_EXTENSIONS_DIR` (default `~/.local/share/gufo/extensions`).
+
+`--yes` skips Gufo's confirmation prompt for unreviewed sources; read the source first (it is native code that runs with your permissions).
+
+Requirement: a Gufo build that ships the extension SDK. That is the `sdk/` directory of a source build tree
+(`<build>/sdk`, beside the `gufo` binary), `<prefix>/lib/gufo/sdk` after installing such a build, or any SDK you
+point Gufo at with `GUFO_SDK_DIR`. The SDK has to come from the same Gufo build as the `gufo` binary you run. You also need the
+toolchain that built that Gufo: CMake 3.27 or newer, Ninja, the same C, C++ and HIP compilers, the ROCm libraries, and
+Git. A Gufo without the SDK (for example the default Nix package) cannot build modules. Gufo's docs name the Nix `#sdk` / `#release-sdk` outputs and the `gufo-runtime` container as SDK-carrying alternatives; neither was tried with this extension. Otherwise use the developer routes below (sections 1 to 3).
+
+Verified: builds and installs as a module on a plain Gufo v0.35.0 source build with `GUFO_SDK_DIR=<build>/sdk`. The measurements in the README come from the in-tree build. Gufo marks modules as experimental (as of November 2026), so the commands may change.
+Served on the GPU (gfx1151) from the installed 0.1.1 module, with no in-tree copy built in: chat, concurrent requests, tool calls, image input, `UD-Q8_K_XL`, and Gufo's discovery, responses, stops, conversation, state-edges, prefill-scheduling and cache functional suites pass; four fixed prompts at temperature 0 give the same text as the in-tree build; and in two Gufo `compare.py` timing pairs no measurement was marked slower than the in-tree build (0 failed; 16 and 5 inconclusive), though neither pair qualified, because one disk-restore cache case varies from run to run on both builds. Details in [`docs/dev/module-test.md`](docs/dev/module-test.md).
+
+After a Gufo upgrade `gufo extension list` shows
+`needs update` until you run `gufo extension update`.
+
+Sections 1 to 3 are the developer route: the extension is compiled into a Gufo build tree that you control.
+
 ## 1. Unit tests (CPU preset, `GUFO_EXTENSION_DIRS`)
 
 ```sh

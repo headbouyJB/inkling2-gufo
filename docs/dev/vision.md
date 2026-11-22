@@ -128,7 +128,7 @@ the same amount (512x320: cos min 0.993, mean 0.99936, rel-L2 3.2 %; 1280x720: m
 toggling flash attention in mtmd alone moves its output by 2.5-2.8 %. The cause is 8-bit activation quantisation
 inside ggml's Q8_0 mat-muls plus f16 K/V in flash attention, amplified over 23 layers. Evidence that our logic is
 right and the residual is noise:
-* Layer-by-layer taps (`MTMD_TAP` / `VISION_TAP`, 40x40 image, our exact mode with ggml's Q8 activation rounding
+* Layer-by-layer taps (`MTMD_TAP` / `INKLING2_VISION_TAP`, 40x40 image, our exact mode with ggml's Q8 activation rounding
   emulated, vs mtmd CPU flash-attn off): embeddings rel-L2 8.6e-5, after layer 0 1.1e-3, then a smooth drift
   to 1.6 % at layer 22 and 1.8 % at the output, no jump at any stage. mtmd ROCm vs mtmd CPU on the same taps:
   0.3 % at the embeddings, 2.2 % at layer 22, 2.5 % at the output, i.e. worse than ours.

@@ -487,7 +487,7 @@ struct VisionEncoder::Impl {
   struct Buf { float* p = nullptr; size_t cap = 0; };
   Buf X, XN, Q, K, V, O, H, OUT, QA, Q16, K16, V16, AH;
   bool exact = false;  // exact reference mode: original weight types, FP32 FMA GEMMs, FP32 attention
-  const char* tap_dir = std::getenv("VISION_TAP");  // debug: dump X after each stage to this dir
+  const char* tap_dir = std::getenv("INKLING2_VISION_TAP");  // debug: dump X after each stage to this dir
   void Tap(hipStream_t s, const char* name, const float* dev, int rows, int cols) {
     if (!tap_dir) return;
     hipStreamSynchronize(s);
