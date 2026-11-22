@@ -2397,6 +2397,9 @@ void CtlPrefill(hipStream_t s, const CtlPJobs& jobs, int t, float eps) {
     const CtlPJob& c = jobs.j[i];
     g.j[i] = {c.x, c.ldx, c.msg, c.ldm, c.down, 4608, 2304, 2304, 1, c.g64, 64, 0};
   }
+  // The 64-row down projection that produces g64 stays F32: f16 weights there move mean KL over
+  // 512 positions from 1.8e-4 to 1.5e-3 (g64 gates every channel through tanh), which is over the
+  // 1e-3 guardrail for a ~1.5 % prefill gain.
   k_gate_p<<<dim3((t + kGateTT - 1) / kGateTT, 1, jobs.n), 512, 0, s>>>(g, t, eps);
   if (t >= 32) k_ctl_apply_w<<<dim3((t + 31) / 32, 36, jobs.n), 256, 0, s>>>(jobs, t);
   else k_ctl_apply_p<<<dim3((t + kCtlTT - 1) / kCtlTT, 36, jobs.n), 512, 0, s>>>(jobs, t);
@@ -2406,6 +2409,8 @@ void CtlPrefill(hipStream_t s, const CtlPJobs& jobs, int t, float eps) {
 void RouterPrefill(hipStream_t s, const float* w, const float* x, float* logits, int t) {
   GateJobs g{};
   g.j[0] = {x, 2304, nullptr, 0, w, 2304, 2304, 0, 0, logits, 128, 0};
+  // The router stays on the F32 kernel: f16 logits flip near-tie expert choices and that costs
+  // 7x more KL (1.4e-3 vs 1.8e-4 over 512 positions) than it saves time (~8 us/token).
   k_gate_p<<<dim3((t + kGateTT - 1) / kGateTT, 2, 1), 512, 0, s>>>(g, t, 0.f);
   Chk("router_prefill");
 }
@@ -2421,6 +2426,8 @@ void SkinnyPrefill(hipStream_t s, const float* x, int ldx, const float* w, int r
                    int ldo, int t) {
   GateJobs g{};
   g.j[0] = {x, ldx, nullptr, 0, w, 2304, 2304, 0, 0, out, ldo, rows};
+  // SkinnyPrefill stays F32: an f16 WMMA version of this GEMM was tried and cost mean KL 1.5e-3
+  // over 512 positions (these matrices feed attention scores directly), over the 1e-3 guardrail.
   k_gate_p<<<dim3((t + kGateTT - 1) / kGateTT, 1, 1), 512, 0, s>>>(g, t, 0.f);
   Chk("skinny_prefill");
 }

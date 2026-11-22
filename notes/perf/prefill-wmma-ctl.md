@@ -45,3 +45,22 @@ WMMA ops each, with the three global streams (`x`, `msg`, `out`, 27.6 KB per tok
 f32 weights re-read and re-converted per 32-token tile. The obvious next steps are (a) a
 load-time f16 copy of gain/forget so the kernel stops converting them per block, and (b) 64
 tokens per block to halve the weight re-reads. Neither is done here.
+
+## Tried and reverted in this branch: `k_gate_w` (f16 WMMA for the skinny F32 GEMMs)
+
+The same WMMA tiling applied to `k_gate_p` (router 128 rows × K 2 304, the 64-row controller
+down-projection with per-segment RMS, and the sink/relative-position `SkinnyPrefill`) gives
+**+5.4 % prefill** (1 552 → 1 636 tok/s in-process) but costs quality:
+
+| configuration | prefill tok/s | meanKL over 512 positions | top-1 |
+| --- | --- | --- | --- |
+| ctl_apply_w only (this branch) | 1 554 | **1.82e-4** | 99.80 % |
+| + router on WMMA | — | 1.38e-3 | 98.83 % |
+| + controller down-projection on WMMA | — | 1.48e-3 | 99.22 % |
+| + SkinnyPrefill on WMMA | 1 636 | 1.48e-3 | 99.41 % |
+
+All three variants are over the goal's 1e-3 mean-KL guardrail, so `k_gate_w` is not in the
+branch. The precision-sensitive pieces are the 64-value `g64` controller vector (it gates every
+channel through `tanh`) and the sink/relative-position matrices (they feed attention scores
+directly). If this is revisited, keep those in F32 and use f16 only where the consumers are
+already f16.
