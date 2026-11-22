@@ -1569,27 +1569,30 @@ __global__ void __launch_bounds__(1024) k_gate_wh(GateJobs jobs, int T, float ep
 // the SIMT kernel moved ~10 MB of LDS per block for a 590 KFLOP/token operation, which is why it
 // sat at ~7 GFLOPS. Block: 32 tokens x 64 channels, 8 warps (4 row groups of 16 x 2 token tiles),
 // weights and activations staged as f16 in LDS (STR = 72 halves, no fragment bank conflicts).
-__global__ void __launch_bounds__(256) k_ctl_apply_w(CtlPJobs jobs, int T) {
-  constexpr int STR = 72, TT = 32, ROWS = 64;
+__global__ void __launch_bounds__(1024) k_ctl_apply_w(CtlPJobs jobs, int T) {
+  // 128 tokens per block (32 warps: 4 row groups of 16 x 8 token tiles) so the 2 304 x 64 gain /
+  // forget tiles are read once per 128 tokens; the 32-token version re-read them per tile, which
+  // was ~37 MB of L2 traffic per launch for a 590 KFLOP/token operation.
+  constexpr int STR = 72, TT = 128, ROWS = 64;
   const CtlPJob& p = jobs.j[blockIdx.z];
   __shared__ _Float16 wg[ROWS][STR], wf[ROWS][STR];
   __shared__ _Float16 gs[TT][STR];
   const int tid = threadIdx.x, t0 = blockIdx.x * TT, c0 = blockIdx.y * ROWS;
   const int lane = tid & 31, warp = tid >> 5, ln = lane & 15, hi = lane >> 4;
-  for (int i = tid; i < ROWS * 16; i += 256) {
+  for (int i = tid; i < ROWS * 16; i += 1024) {
     const int row = i >> 4, c4 = i & 15;
     const float4 a = *(const float4*)(p.gain + (size_t)(c0 + row) * 64 + c4 * 4);
     const float4 b = *(const float4*)(p.forget + (size_t)(c0 + row) * 64 + c4 * 4);
     *(uint64_t*)&wg[row][c4 * 4] = pack4h(a);   // one 8 B store, not four 2 B halves
     *(uint64_t*)&wf[row][c4 * 4] = pack4h(b);
   }
-  for (int i = tid; i < TT * 16; i += 256) {
+  for (int i = tid; i < TT * 16; i += 1024) {
     const int tk = i >> 4, c4 = i & 15;
     const int t = min(t0 + tk, T - 1);
     *(uint64_t*)&gs[tk][c4 * 4] = pack4h(*(const float4*)(p.g64 + (size_t)t * 64 + c4 * 4));
   }
   __syncthreads();
-  const int rt = warp >> 1, tt = warp & 1;
+  const int rt = warp >> 3, tt = warp & 7;
   v8f ga = {0, 0, 0, 0, 0, 0, 0, 0}, fo = ga;
   const int rrow = rt * 16 + ln, trow = tt * 16 + ln;
 #pragma unroll
@@ -2491,7 +2494,7 @@ void CtlPrefill(hipStream_t s, const CtlPJobs& jobs, int t, float eps) {
   // 1e-3 guardrail for a ~1.5 % prefill gain.
   if (t >= kGwTT) k_gate_wh<<<dim3((t + kGwTT - 1) / kGwTT, 1, jobs.n), 1024, 0, s>>>(g, t, eps);
   else k_gate_p<<<dim3((t + kGateTT - 1) / kGateTT, 1, jobs.n), 512, 0, s>>>(g, t, eps);
-  if (t >= 32) k_ctl_apply_w<<<dim3((t + 31) / 32, 36, jobs.n), 256, 0, s>>>(jobs, t);
+  if (t >= 128) k_ctl_apply_w<<<dim3((t + 127) / 128, 36, jobs.n), 1024, 0, s>>>(jobs, t);
   else k_ctl_apply_p<<<dim3((t + kCtlTT - 1) / kCtlTT, 36, jobs.n), 512, 0, s>>>(jobs, t);
   Chk("ctl_prefill");
 }
