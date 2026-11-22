@@ -1475,6 +1475,95 @@ __device__ __forceinline__ uint64_t pack4h(float4 v) {
   return h0 | (h1 << 16) | (h2 << 32) | (h3 << 48);
 }
 
+// low half of a split-f16 pair: the residual v - f16(v), packed like pack4h
+__device__ __forceinline__ uint64_t pack4l(float4 v) {
+  const _Float16 a = (_Float16)v.x, b = (_Float16)v.y, c = (_Float16)v.z, d = (_Float16)v.w;
+  return pack4h((float4){v.x - (float)a, v.y - (float)b, v.z - (float)c, v.w - (float)d});
+}
+
+
+
+// Tensor-core version of k_gate_p for the skinny F32 prefill matrices (router 128 rows, the 64-row
+// controller down-projection with per-segment RMS, the sink/relative-position "skinny" GEMM).
+// 64 rows x 128 tokens per block, 32 warps (4 row groups of 16 x 8 token tiles), so the weight
+// tiles are read once per 128 tokens instead of once per 32 — that re-read was ~112 MB of L2
+// traffic per launch in the 32-token version. Weights AND activations are carried as split-f16
+// hi/lo pairs and accumulated as Wh*Xh + Wl*Xh + Wh*Xl, which keeps ~1e-6 relative error: the
+// plain f16 version of this kernel was 5 % faster but cost mean KL 1.5e-3 (over the 1e-3
+// guardrail) because f16 rounding of these particular matrices moves expert choices and attention
+// scores.
+constexpr int kGwTT = 128, kGwROWS = 64;
+__global__ void __launch_bounds__(1024) k_gate_wh(GateJobs jobs, int T, float eps) {
+  constexpr int STR = 72;
+  const GateP& p = jobs.j[blockIdx.z];
+  __shared__ _Float16 whi[kGwROWS][STR], wlo[kGwROWS][STR];
+  __shared__ _Float16 xhi[kGwTT][STR], xlo[kGwTT][STR];
+  __shared__ float inv[2][kGwTT];
+  const int tid = threadIdx.x, t0 = blockIdx.x * kGwTT, r0 = blockIdx.y * kGwROWS;
+  const int lane = tid & 31, warp = tid >> 5, ln = lane & 15, hi = lane >> 4;
+  // per-token inverse RMS of each segment (32 warps for 128 tokens)
+#pragma unroll
+  for (int u = 0; u < kGwTT / 32; ++u) {
+    const int tk = warp + 32 * u;
+    const int t = min(t0 + tk, T - 1);
+    float s1 = 1.f, s2 = 1.f;
+    if (p.rms) {
+      float a = 0.f, b = 0.f;
+      for (int i = lane; i < p.k1; i += 32) { float v = p.x[(size_t)t * p.ldx + i]; a += v * v; }
+      for (int i = lane; i < p.k2; i += 32) { float v = p.msg[(size_t)t * p.ldm + i]; b += v * v; }
+      a = wsum(a);
+      b = wsum(b);
+      s1 = rsqrtf(a / p.k1 + eps);
+      s2 = p.k2 ? rsqrtf(b / p.k2 + eps) : 1.f;
+    }
+    if (lane == 0) { inv[0][tk] = s1; inv[1][tk] = s2; }
+  }
+  __syncthreads();
+  const int rt = warp >> 3, tt = warp & 7;
+  v8f acc = {0, 0, 0, 0, 0, 0, 0, 0};
+  const int ktot = p.k1 + p.k2;
+  for (int kc = 0; kc < ktot; kc += 64) {
+    __syncthreads();
+    for (int i = tid; i < kGwROWS * 16; i += 1024) {
+      const int row = i >> 4, c4 = i & 15;
+      const float4 v = *(const float4*)(p.W + (size_t)(r0 + row) * p.ldw + kc + c4 * 4);
+      *(uint64_t*)&whi[row][c4 * 4] = pack4h(v);
+      *(uint64_t*)&wlo[row][c4 * 4] = pack4l(v);
+    }
+    const bool seg2 = kc >= p.k1;
+    const float* src = seg2 ? p.msg : p.x;
+    const int ld = seg2 ? p.ldm : p.ldx, kk = seg2 ? kc - p.k1 : kc;
+    for (int i = tid; i < kGwTT * 16; i += 1024) {
+      const int tk = i >> 4, c4 = i & 15;
+      const int t = min(t0 + tk, T - 1);
+      const float sc = inv[seg2 ? 1 : 0][tk];
+      float4 v = *(const float4*)(src + (size_t)t * ld + kk + c4 * 4);
+      v.x *= sc; v.y *= sc; v.z *= sc; v.w *= sc;
+      *(uint64_t*)&xhi[tk][c4 * 4] = pack4h(v);
+      *(uint64_t*)&xlo[tk][c4 * 4] = pack4l(v);
+    }
+    __syncthreads();
+    const int rrow = rt * 16 + ln, trow = tt * 16 + ln;
+#pragma unroll
+    for (int ks = 0; ks < 4; ks++) {
+      const v16h_a16 bh = *(const v16h_a16*)&whi[rrow][ks * 16];
+      const v16h_a16 bl = *(const v16h_a16*)&wlo[rrow][ks * 16];
+      const v16h_a16 ah = *(const v16h_a16*)&xhi[trow][ks * 16];
+      const v16h_a16 al = *(const v16h_a16*)&xlo[trow][ks * 16];
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ah, bh, acc);
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ah, bl, acc);
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(al, bh, acc);
+    }
+  }
+  const int row = r0 + rt * 16 + ln;
+  if (p.rows && row >= p.rows) return;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const int t = t0 + tt * 16 + 2 * i + hi;
+    if (t < T) p.out[(size_t)t * p.ldo + row] = acc[i];
+  }
+}
+
 // k_ctl_apply_p with tensor cores. Same math as the SIMT version (out = x - tanh(Wf g64) x +
 // tanh(Wg g64) msg, K = 64) but the 2 304 x 64 gain/forget tiles are consumed as WMMA fragments:
 // the SIMT kernel moved ~10 MB of LDS per block for a 590 KFLOP/token operation, which is why it
@@ -2400,7 +2489,8 @@ void CtlPrefill(hipStream_t s, const CtlPJobs& jobs, int t, float eps) {
   // The 64-row down projection that produces g64 stays F32: f16 weights there move mean KL over
   // 512 positions from 1.8e-4 to 1.5e-3 (g64 gates every channel through tanh), which is over the
   // 1e-3 guardrail for a ~1.5 % prefill gain.
-  k_gate_p<<<dim3((t + kGateTT - 1) / kGateTT, 1, jobs.n), 512, 0, s>>>(g, t, eps);
+  if (t >= kGwTT) k_gate_wh<<<dim3((t + kGwTT - 1) / kGwTT, 1, jobs.n), 1024, 0, s>>>(g, t, eps);
+  else k_gate_p<<<dim3((t + kGateTT - 1) / kGateTT, 1, jobs.n), 512, 0, s>>>(g, t, eps);
   if (t >= 32) k_ctl_apply_w<<<dim3((t + 31) / 32, 36, jobs.n), 256, 0, s>>>(jobs, t);
   else k_ctl_apply_p<<<dim3((t + kCtlTT - 1) / kCtlTT, 36, jobs.n), 512, 0, s>>>(jobs, t);
   Chk("ctl_prefill");
@@ -2411,6 +2501,9 @@ void RouterPrefill(hipStream_t s, const float* w, const float* x, float* logits,
   g.j[0] = {x, 2304, nullptr, 0, w, 2304, 2304, 0, 0, logits, 128, 0};
   // The router stays on the F32 kernel: f16 logits flip near-tie expert choices and that costs
   // 7x more KL (1.4e-3 vs 1.8e-4 over 512 positions) than it saves time (~8 us/token).
+  // The router stays F32: its logits go through a discrete top-8, so even a 1e-7 change of the
+  // summation order flips near-tie experts and costs ~1e-3 KL (measured with both the f16 and the
+  // split-f16 version of this GEMM).
   k_gate_p<<<dim3((t + kGateTT - 1) / kGateTT, 2, 1), 512, 0, s>>>(g, t, 0.f);
   Chk("router_prefill");
 }
