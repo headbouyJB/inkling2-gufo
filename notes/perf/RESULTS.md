@@ -64,11 +64,20 @@ sweep of the 20 decode tuning variants behind `INKLING2_TUNE` moved decode by �
 noise). Kernel work cannot close the gap: it needs ≥1.65 tokens per weight pass, which is
 speculation, not optimisation.
 
-Speculation is analysed in [`dspark-feasibility.md`](dspark-feasibility.md): the drafter GGUF is
-downloaded and verified, the round-cost model (dense part shared, MoE part per token, drafter
-≈2.4 GB per round) says a 3-draft round costs ~45 ms for 1+a tokens, so 66 tok/s at 67 %
-acceptance, 88 tok/s at 100 % — and 100 tok/s needs more than 4 accepted drafts every round.
-Not implemented; the 1 200–1 800 line inventory is in that note.
+Speculation is priced in [`dspark-feasibility.md`](dspark-feasibility.md) and **measured** in
+[`dspark-verify.md`](dspark-verify.md). Correction to the table above: the 43.49 ms at width 4 was
+`DecodeBatch` (four independent sessions), which a causal verifier cannot use — a verifier must
+evaluate consecutive positions of *one* session. Through `Forward` that costs 78–86 ms (the prefill
+kernels carry a ~65 ms floor for spans under 64 tokens); through the decode kernels, which
+`perf/dspark-verify` now provides, it costs **43.2 ms** and is bit-exact (verifier + rollback
+landed, `verify:identical` on mixed acceptance).
+
+So the corrected picture: the verifier alone, drafter free, is 4 / 43.2 ms = **93 tok/s at 100 %
+acceptance**; with the drafter's real ~10 ms/round it is **62 tok/s at the 76 % acceptance this
+box's own MTP achieves** (67 % → 57, 90 % → 70). A 1.4x gain on 45 tok/s, not the 100 the goal asks
+for: that needs four accepted drafts every round with a free drafter. The drafter artifact binds and
+validates (`inkling2_bench --dspark`), the target-feature taps work (`--feat`); the drafter forward
+itself is the remaining piece.
 
 ### Prefill 2 000 tok/s: 28 % short, and the remaining costs are structural
 
