@@ -39,7 +39,7 @@
 
 int main(int argc, char** argv) {
   std::string model, text, ids_in, ctxs = "64,4096", batches, spec, dspark_path;
-  bool verify = false, same = false, spec_forward = false;
+  bool verify = false, same = false, spec_forward = false, feat = false;
   int decode = 64;
   unsigned ctx = 32768;
   for (int i = 1; i < argc; ++i) {
@@ -53,6 +53,7 @@ int main(int argc, char** argv) {
     else if (k == "--batch") batches = next();
     else if (k == "--verify") verify = true;
     else if (k == "--spec") spec = next();
+    else if (k == "--feat") feat = true;  // exercise the DSpark feature taps and exit
     else if (k == "--dspark") dspark_path = next();  // bind and describe a drafter artifact, then exit
     else if (k == "--specF") { spec = next(); spec_forward = true; }
     else if (k == "--same") same = true;  // identical prompts in all sessions (debug)
@@ -110,6 +111,31 @@ int main(int argc, char** argv) {
   if (!engine) { std::fprintf(stderr, "engine: %s\n", err.c_str()); return 1; }
   auto session = engine->NewSession();
   const std::size_t V = engine->config().n_vocab_text;
+  if (feat) {
+    // The drafter's context injection reads the hidden ENTERING visits 5/23/41 and the final normed
+    // hidden. They must all be finite, and distinct -- identical rows would mean a tap fires at the
+    // wrong visit. RMS is norm-scale (~1 for the normed ones), not a bit-exact check.
+    engine->EnableDraftFeatures(true);
+    const std::size_t n = std::min<std::size_t>(16, ids.size());
+    engine->Forward(*session, std::span<const std::int32_t>(ids.data(), n));
+    const auto f = engine->DraftFeatures();
+    const std::size_t E = engine->config().n_embd;
+    if (f.size() != 4 * E) { std::fprintf(stderr, "feat: %zu floats, expected %zu\n", f.size(), 4 * E); return 1; }
+    for (int k = 0; k < 4; ++k) {
+      const float* r = f.data() + static_cast<std::size_t>(k) * E;
+      double ss = 0;
+      float mn = r[0], mx = r[0];
+      for (std::size_t i = 0; i < E; ++i) {
+        if (!std::isfinite(r[i])) { std::fprintf(stderr, "feat %d: non-finite\n", k); return 1; }
+        ss += static_cast<double>(r[i]) * r[i];
+        mn = std::min(mn, r[i]);
+        mx = std::max(mx, r[i]);
+      }
+      std::printf("feat %d  rms %.6f  min %+.4f  max %+.4f  head %+.5f\n", k,
+                  std::sqrt(ss / static_cast<double>(E)), mn, mx, r[0]);
+    }
+    return 0;
+  }
   for (int C : (batches.empty() || !verify) ? lens : std::vector<int>{}) {
     engine->Reset(*session);
     const auto t0 = std::chrono::steady_clock::now();
