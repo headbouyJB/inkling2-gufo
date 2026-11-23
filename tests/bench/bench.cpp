@@ -1,12 +1,19 @@
 // Speed bench for the Inkling 2 Mini HIP engine.
 //
 //   inkling2_bench --model GGUF --text FILE --ctxs 64,4096,16384,32000 [--decode 64] [--ctx 32768]
-//                  [--batch 2,3,4] [--verify]
+//                  [--batch 2,3,4] [--verify] [--spec K[:accept]]
 //
 // --batch B...: after the single-session lines, for each B: B sessions (different text slices), each
 // prefilled with C tokens, then --decode steps of Engine::DecodeBatch (one token per session per
 // step, greedy). Prints the aggregate and per-session tok/s. --verify also runs the same sessions
 // through single-token Forward calls and reports the largest logit difference and token agreement.
+//
+// --spec K:A: speculative-verify self-test (DSpark verifier). Plain greedy decode is the reference;
+// the speculative pass drafts K tokens per round (a fraction A of them copied from the reference
+// continuation, the rest deliberately wrong, so acceptance is mixed rather than perfect), verifies
+// them with one K+1-token Forward, rewinds the rejected suffix with Engine::RewindVerified and
+// continues. Prints the acceptance rate, ms per round, tokens/round and the effective tok/s, and
+// exits non-zero unless the emitted stream is identical to the reference greedy stream.
 //
 // For every context length C: fresh session, timed prefill of C tokens (one Forward call, only the
 // last logits are read back), then --decode greedy single-token Forward calls (timed). Prints
@@ -19,6 +26,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -29,7 +37,7 @@
 #include "text/tokenizer.hpp"
 
 int main(int argc, char** argv) {
-  std::string model, text, ids_in, ctxs = "64,4096", batches;
+  std::string model, text, ids_in, ctxs = "64,4096", batches, spec;
   bool verify = false, same = false;
   int decode = 64;
   unsigned ctx = 32768;
@@ -43,6 +51,7 @@ int main(int argc, char** argv) {
     else if (k == "--decode") decode = std::atoi(next().c_str());
     else if (k == "--batch") batches = next();
     else if (k == "--verify") verify = true;
+    else if (k == "--spec") spec = next();
     else if (k == "--same") same = true;  // identical prompts in all sessions (debug)
     else if (k == "--ctx") ctx = static_cast<unsigned>(std::strtoul(next().c_str(), nullptr, 10));
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
@@ -175,6 +184,97 @@ int main(int argc, char** argv) {
       }
       std::fflush(stdout);
     }
+  }
+
+  // ---- speculative verify self-test (DSpark verifier, no drafter) ----
+  if (!spec.empty()) {
+    int K = 4;
+    double acc_target = 0.75;
+    {
+      const std::size_t colon = spec.find(':');
+      K = std::atoi(spec.substr(0, colon).c_str());
+      if (colon != std::string::npos) acc_target = std::atof(spec.substr(colon + 1).c_str());
+    }
+    if (K < 1 || K + 1 > static_cast<int>(gufo::models::inkling2::Engine::kMaxVerify)) {
+      std::fprintf(stderr, "--spec K must be 1..%zu\n", gufo::models::inkling2::Engine::kMaxVerify - 1);
+      return 2;
+    }
+    const std::size_t V = engine->config().n_vocab_text;
+    int bad = 0;
+    for (int C : lens) {
+      const std::span<const std::int32_t> prompt(ids.data(), static_cast<std::size_t>(C));
+      // reference: plain greedy, one token per Forward
+      auto ref = engine->NewSession();
+      engine->Forward(*ref, prompt);
+      std::vector<std::int32_t> refseq;
+      refseq.reserve(static_cast<std::size_t>(decode));
+      std::int32_t t = argmax(ref->logits());
+      refseq.push_back(t);
+      for (int i = 1; i < decode; ++i) {
+        engine->Forward(*ref, std::span<const std::int32_t>(&t, 1));
+        t = argmax(ref->logits());
+        refseq.push_back(t);
+      }
+      // speculative: draft K, verify with one K+1 Forward, rewind the rejected suffix
+      auto sp = engine->NewSession();
+      engine->Forward(*sp, prompt);
+      if (!engine->EnableVerify(*sp, static_cast<std::size_t>(K) + 1)) {
+        std::fprintf(stderr, "EnableVerify refused K=%d\n", K);
+        return 2;
+      }
+      std::mt19937 rng(12345);
+      std::uniform_real_distribution<double> uni(0.0, 1.0);
+      std::vector<std::int32_t> got;
+      double ms = 0;
+      long rounds = 0, drafted = 0, accepted = 0;
+      while (got.size() < refseq.size()) {
+        std::vector<std::int32_t> toks;
+        toks.push_back(argmax(sp->logits()));
+        for (int i = 0; i < K; ++i) {
+          const std::size_t at = got.size() + 1 + static_cast<std::size_t>(i);
+          if (at < refseq.size() && uni(rng) < acc_target) {
+            toks.push_back(refseq[at]);
+          } else {
+            toks.push_back(static_cast<std::int32_t>(rng() % V));
+          }
+        }
+        std::vector<std::vector<float>> rows(toks.size());
+        const auto t1 = std::chrono::steady_clock::now();
+        engine->Forward(*sp, toks, [&](std::size_t first, std::size_t count, const float* data) {
+          for (std::size_t i = 0; i < count; ++i)
+            rows[first + i].assign(data + i * V, data + (i + 1) * V);
+        });
+        std::size_t a = 0;  // matched drafts
+        while (a < static_cast<std::size_t>(K) && argmax(rows[a]) == toks[a + 1]) ++a;
+        const auto t2 = std::chrono::steady_clock::now();
+        engine->RewindVerified(*sp, a + 1, rows[a]);
+        ms += std::chrono::duration<double>(t2 - t1).count() * 1000.0;
+        ++rounds;
+        drafted += K;
+        accepted += static_cast<long>(a);
+        for (std::size_t i = 0; i <= a; ++i) got.push_back(toks[i]);
+        engine->EnableVerify(*sp, static_cast<std::size_t>(K) + 1);  // re-arm for the next round
+      }
+      const bool ok = got.size() >= refseq.size() &&
+                      std::equal(refseq.begin(), refseq.end(), got.begin());
+      const double per_round = ms / static_cast<double>(rounds);
+      std::printf("spec K=%d ctx %6d  accept %5.1f%%  %6.2f ms/round  %4.2f tok/round  "
+                  "%6.2f tok/s  verify:%s\n",
+                  K, C, 100.0 * static_cast<double>(accepted) / static_cast<double>(drafted),
+                  per_round, static_cast<double>(got.size()) / static_cast<double>(rounds),
+                  1000.0 / per_round * static_cast<double>(got.size()) / static_cast<double>(rounds),
+                  ok ? "identical" : "MISMATCH");
+      if (!ok) {
+        ++bad;
+        for (std::size_t i = 0; i < refseq.size() && i < got.size(); ++i)
+          if (refseq[i] != got[i]) {
+            std::printf("  first divergence at token %zu: ref %d got %d\n", i, refseq[i], got[i]);
+            break;
+          }
+      }
+      std::fflush(stdout);
+    }
+    return bad == 0 ? 0 : 1;
   }
   return 0;
 }

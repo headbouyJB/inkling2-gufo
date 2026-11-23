@@ -95,6 +95,13 @@ private:
   };
   std::array<Slot, 48> slots_{};
   void* tbl_ = nullptr;  // device table of the 48 slots (fast::SlotEntry[48])
+
+  // Speculative verify (DSpark). While snap_t_ > 0 a Forward of n <= snap_t_ tokens records, per
+  // visit and per token, the conv state the recurrence held after that token, so a partial
+  // acceptance can rewind without re-running the pass. Layout: [48][snap_t_][kConvChannels][3].
+  float* snap_ = nullptr;
+  int snap_t_ = 0;
+  std::size_t verify_pos_ = 0;  // position the verify Forward started at
 };
 
 class Engine {
@@ -116,6 +123,22 @@ public:
   [[nodiscard]] std::unique_ptr<Session> NewSession();
   void Reset(Session& s);
 
+  /// Prepares `s` for speculative verify: the next Forward of n <= max_draft tokens records the
+  /// intermediate conv states. Allocates the snapshot on first use (zeroed, then reused). Returns
+  /// false when max_draft is out of range; nothing else makes it fail.
+  bool EnableVerify(Session& s, std::size_t max_draft);
+
+  /// Ends a verify round after its Forward: drops the snapshots and keeps the model state as if
+  /// only the first `accepted` (1..n) draft positions had been evaluated. KV needs no restore:
+  /// rows the rejected drafts wrote are at or above the new position, and no read addresses a row
+  /// above the position, so the next write overwrites them. Conv state and position are restored.
+  /// `logits_of_last_accepted` (vocab_text floats, host) becomes the session's logits when given.
+  void RewindVerified(Session& s, std::size_t accepted,
+                     std::span<const float> logits_of_last_accepted = {});
+
+  /// Bytes one session's verify snapshots occupy (0 before EnableVerify).
+  [[nodiscard]] std::size_t verify_snapshot_bytes() const;
+
   /// Receives the logits of `count` consecutive positions starting at `first` (index into the
   /// `tokens` span of the Forward call), `count x vocab_text` floats, soft-capped.
   using LogitsSink = std::function<void(std::size_t first, std::size_t count, const float* data)>;
@@ -132,6 +155,8 @@ public:
   void Synchronize();
 
   static constexpr std::size_t kMaxDecodeBatch = 4;
+  /// Largest draft block the verifier accepts (the target's own decode batch width).
+  static constexpr std::size_t kMaxVerify = kMaxDecodeBatch;
   /// One decode step (one token each) for up to 4 distinct sessions under a single lock. The runner's
   /// `AdvanceBatch` calls it. M3: one graph launch reads the weights once for all tokens (GEMV -> small
   /// GEMM over the tokens, MoE per (token, expert) pair, attention per session); each session's

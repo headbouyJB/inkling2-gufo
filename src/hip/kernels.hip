@@ -439,6 +439,30 @@ __global__ void conv_state_k(const float* __restrict__ x, float* __restrict__ st
   for (int j = 0; j < 3; ++j) state[static_cast<size_t>(c) * 3 + j] = nw[j];
 }
 
+// conv_state_k is applied step by step so the state after each token is observable. For t_count >= 3
+// the final state is the same as conv_state_k's (last 3 of concat(state, x)); for t_count < 3 both
+// agree too, because nw[j] = old[t_count + j] is exactly the shift this loop performs.
+__global__ void conv_state_snap_k(const float* __restrict__ x, float* __restrict__ state,
+                                  float* __restrict__ snap, int snap_stride, int t_count, int C) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  float h[3] = {state[static_cast<size_t>(c) * 3], state[static_cast<size_t>(c) * 3 + 1],
+                state[static_cast<size_t>(c) * 3 + 2]};
+  const size_t stride = static_cast<size_t>(snap_stride);
+  for (int t = 0; t < t_count; ++t) {
+    h[0] = h[1];
+    h[1] = h[2];
+    h[2] = x[static_cast<size_t>(t) * C + c];
+    if (snap != nullptr) {
+      float* dst = snap + static_cast<size_t>(t) * stride + static_cast<size_t>(c) * 3;
+      dst[0] = h[0];
+      dst[1] = h[1];
+      dst[2] = h[2];
+    }
+  }
+  for (int j = 0; j < 3; ++j) state[static_cast<size_t>(c) * 3 + j] = h[j];
+}
+
 __global__ void kv_write_k(const float* __restrict__ k, const float* __restrict__ v,
                            __half* __restrict__ kc, __half* __restrict__ vc, int pos0, int t_count,
                            int ring) {
@@ -695,6 +719,13 @@ void Conv(hipStream_t s, const float* x, const float* state, const float* w, con
 void ConvStateUpdate(hipStream_t s, const float* x, float* state, int t_count, int channels) {
   conv_state_k<<<(channels + 127) / 128, 128, 0, s>>>(x, state, t_count, channels);
   Check(hipGetLastError(), "conv_state");
+}
+
+void ConvStateUpdateSnap(hipStream_t s, const float* x, float* state, float* snap, int snap_stride,
+                         int t_count, int channels) {
+  conv_state_snap_k<<<(channels + 127) / 128, 128, 0, s>>>(x, state, snap, snap_stride, t_count,
+                                                          channels);
+  Check(hipGetLastError(), "conv_state_snap");
 }
 
 void KvWrite(hipStream_t s, const float* k, const float* v, void* kc, void* vc, int pos0,

@@ -177,6 +177,23 @@ struct Engine::Impl {
     Check(hipStreamWaitEvent(ds, e, 0), "join wait");
   }
   bool fast_prefill = true;
+  // Speculative verify: while snap != nullptr the conv-state updates of this Forward also record
+  // the state after every token, per visit, so RewindVerified can drop a rejected suffix.
+  float* snap = nullptr;
+  int snap_t = 0;  // tokens the snapshot was sized for
+
+  /// Advances the conv state of one stream of visit `slot_idx` by T tokens, recording
+  /// intermediate states when a verify Forward is in flight.
+  void ConvState(int slot_idx, const float* x, float* state, int channels, int conv_off) {
+    if (snap == nullptr) {
+      kk::ConvStateUpdate(s, x, state, T, channels);
+      return;
+    }
+    float* base = snap + (static_cast<std::size_t>(slot_idx) * snap_t) * kConvChannels * 3 +
+                  static_cast<std::size_t>(conv_off) * 3;
+    kk::ConvStateUpdateSnap(s, x, state, base, kConvChannels * 3, T, channels);
+  }
+
   // INKLING2_PROFILE=1 (needs INKLING2_NOGRAPH=1): per-section GPU time of the decode step
   bool prof = false;
   std::vector<std::pair<const char*, hipEvent_t>> prof_ev;
@@ -778,8 +795,8 @@ struct Engine::Impl {
     float* cs = slot.conv;
     kk::Conv(s, Kb, cs + kConvOffK * 3, DF(L.attn_k_conv), dk, Kc, T, kKV, 128, conv_scale);
     kk::Conv(s, Vb, cs + kConvOffV * 3, DF(L.attn_v_conv), dv, Vc, T, kKV, 128, conv_scale);
-    kk::ConvStateUpdate(s, Kb, cs + kConvOffK * 3, T, kKV);
-    kk::ConvStateUpdate(s, Vb, cs + kConvOffV * 3, T, kKV);
+    ConvState(slot_idx, Kb, cs + kConvOffK * 3, kKV, kConvOffK);
+    ConvState(slot_idx, Vb, cs + kConvOffV * 3, kKV, kConvOffV);
 
     PMark("p_proj");
     // C/D. clips, KV write, attention
@@ -836,7 +853,7 @@ struct Engine::Impl {
     }
     kk::Conv(s, AOp, cs + kConvOffAttn * 3, DF(L.attn_post_conv), nullptr, AO, T, kEmbd, 128,
              1.0f / std::sqrt(5.0f));
-    kk::ConvStateUpdate(s, AOp, cs + kConvOffAttn * 3, T, kEmbd);
+    ConvState(slot_idx, AOp, cs + kConvOffAttn * 3, kEmbd, kConvOffAttn);
 
     PMark("p_oproj");
     // E. residual / block bookkeeping
@@ -886,7 +903,7 @@ struct Engine::Impl {
     PMark("p_moe");
     kk::Conv(s, moe, cs + kConvOffFfn * 3, DF(L.ffn_post_conv), nullptr, AO, T, kEmbd, 128,
              1.0f / std::sqrt(5.0f));
-    kk::ConvStateUpdate(s, moe, cs + kConvOffFfn * 3, T, kEmbd);
+    ConvState(slot_idx, moe, cs + kConvOffFfn * 3, kEmbd, kConvOffFfn);
     kk::Add(s, cur, AO, cur, T * kEmbd);
     PMark("p_tail");
   }
@@ -1609,6 +1626,7 @@ Session::~Session() {
     if (sl.conv) (void)hipFree(sl.conv);
   }
   if (tbl_) (void)hipFree(tbl_);
+  if (snap_) (void)hipFree(snap_);
 }
 
 Engine::~Engine() = default;
@@ -1657,6 +1675,54 @@ std::size_t Engine::session_bytes() const {
          48 * static_cast<std::size_t>(kConvChannels) * 3 * 4;
 }
 
+std::size_t Engine::verify_snapshot_bytes() const {
+  return 48 * static_cast<std::size_t>(kMaxVerify) * kConvChannels * 3 * 4;
+}
+
+bool Engine::EnableVerify(Session& s, std::size_t max_draft) {
+  if (max_draft < 2 || max_draft > kMaxVerify) return false;
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  const std::size_t want = 48 * max_draft * static_cast<std::size_t>(kConvChannels) * 3;
+  if (s.snap_ == nullptr || static_cast<std::size_t>(s.snap_t_) < max_draft) {
+    if (s.snap_ != nullptr) {
+      Check(hipStreamSynchronize(impl_->s), "snapshot free sync");
+      (void)hipFree(s.snap_);
+      s.snap_ = nullptr;
+      s.snap_t_ = 0;
+    }
+    s.snap_ = static_cast<float*>(AllocDevice(want * 4, "verify snapshot"));
+    s.bytes_ += want * 4;
+  }
+  s.snap_t_ = static_cast<int>(max_draft);
+  return true;
+}
+
+void Engine::RewindVerified(Session& s, std::size_t accepted,
+                            std::span<const float> logits_of_last_accepted) {
+  if (s.snap_ == nullptr || s.snap_t_ == 0)
+    throw std::runtime_error("inkling2: RewindVerified without EnableVerify");
+  if (accepted == 0 || accepted > static_cast<std::size_t>(s.snap_t_))
+    throw std::runtime_error("inkling2: accepted count outside the verified block");
+  std::unique_lock<std::mutex> lock(mutex_);
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  // The state wanted is the one the recurrence held after the last ACCEPTED token, i.e. snapshot
+  // entry accepted - 1 (accepted >= 1 is enforced above).
+  const std::size_t idx = accepted - 1;
+  const std::size_t per_visit = static_cast<std::size_t>(kConvChannels) * 3 * 4;
+  for (std::size_t v = 0; v < 48; ++v) {
+    const float* src = s.snap_ + (v * static_cast<std::size_t>(s.snap_t_) + idx) * kConvChannels * 3;
+    Check(hipMemcpyAsync(s.slots_[v].conv, src, per_visit, hipMemcpyDeviceToDevice, impl_->s),
+          "conv rewind copy");
+  }
+  s.pos_ = s.verify_pos_ + accepted;
+  s.snap_t_ = 0;  // a rewind ends the verify round; EnableVerify re-arms it
+  if (!logits_of_last_accepted.empty()) {
+    if (logits_of_last_accepted.size() != weights_.config.n_vocab_text)
+      throw std::runtime_error("inkling2: rewind logits have the wrong size");
+    s.logits_.assign(logits_of_last_accepted.begin(), logits_of_last_accepted.end());
+  }
+}
+
 std::unique_ptr<Session> Engine::NewSession() {
   std::unique_ptr<Session> s(new Session());
   std::shared_lock<std::shared_mutex> gate(CaptureGate());
@@ -1691,6 +1757,7 @@ void Engine::Reset(Session& s) {
       Check(hipMemset(sl.conv, 0, kConvChannels * 3 * 4), "conv reset");
   }
   s.pos_ = 0;
+  s.snap_t_ = 0;  // a reset invalidates any in-flight verify round
   s.logits_.clear();
 }
 
@@ -1754,7 +1821,25 @@ void Engine::Forward(Session& s, std::span<const std::int32_t> tokens, const Log
     ~RowsScope() { i->input_rows = saved; }
   } rows_scope{impl_.get(), impl_->input_rows};
   impl_->input_rows = rows;
-  if (tokens.size() == 1 && rows.empty() && impl_->fast_decode) {
+  // A verify Forward always goes through Ubatch (never the single-token fast path), so the conv
+  // snapshots and the token count stay uniform for the rewind.
+  struct SnapScope {
+    Impl* i;
+    bool on;
+    ~SnapScope() {
+      if (on) {
+        i->snap = nullptr;
+        i->snap_t = 0;
+      }
+    }
+  } snap_scope{impl_.get(), false};
+  if (s.snap_ != nullptr && s.snap_t_ > 0 && tokens.size() <= static_cast<std::size_t>(s.snap_t_)) {
+    impl_->snap = s.snap_;
+    impl_->snap_t = s.snap_t_;
+    snap_scope.on = true;
+    s.verify_pos_ = s.pos_;
+  }
+  if (tokens.size() == 1 && rows.empty() && impl_->fast_decode && impl_->snap == nullptr) {
     if (s.hooks_ != nullptr) s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);  // M2 hook
     impl_->Decode(s, tokens[0], &s.logits_);
     if (sink) sink(0, 1, s.logits_.data());

@@ -76,6 +76,13 @@ void Conv(hipStream_t s, const float* x, const float* state, const float* w, con
           float* out, int t_count, int channels, int hd, float scale);
 void ConvStateUpdate(hipStream_t s, const float* x, float* state, int t_count, int channels);
 
+/// Same result as ConvStateUpdate, plus the state after every intermediate token: at
+/// snap + t * snap_stride lies the [C][3] state the recurrence would hold if only x[0..t] had been
+/// consumed (recorded inside one launch, so speculative verify can rewind to any accepted prefix).
+/// snap_stride lets callers keep their own per-token stride (the verifier's is wider than C * 3).
+void ConvStateUpdateSnap(hipStream_t s, const float* x, float* state, float* snap, int snap_stride,
+                         int t_count, int channels);
+
 void KvWrite(hipStream_t s, const float* k, const float* v, void* kc, void* vc, int pos0,
              int t_count, int ring_rows);
 
