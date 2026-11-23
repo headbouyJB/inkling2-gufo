@@ -170,6 +170,47 @@ def fmt(x, nd=1):
     return "-" if x is None else f"{x:.{nd}f}"
 
 
+
+def free_resident(swap_url, api_key, need_gib=25, wait_s=90):
+    """Ask llama-swap to unload whatever is resident, then wait for RAM to come back.
+
+    The bench measures one model at a time, but llama-swap keeps the last requested model
+    resident: a 113 GB one starves a 17.6 GB load, which then falls back to managed memory and
+    either crawls or OOMs. Two full runs were lost to this before it was automated. Best effort:
+    a missing llama-swap, a rejected key or a non-swap base URL must not fail the benchmark.
+    """
+    if not api_key:
+        return None
+    url = swap_url.rstrip("/") + "/api/models/unload"
+    req = urllib.request.Request(url, data=b"", method="POST",
+                                 headers={"Authorization": "Bearer " + api_key})
+    try:
+        urllib.request.urlopen(req, timeout=60).read()
+    except Exception as exc:  # noqa: BLE001 - best effort by design
+        print(f"bench: unload skipped ({exc})", file=sys.stderr)
+        return None
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        avail = mem_available_gib()
+        if avail is None or avail >= need_gib:
+            break
+        time.sleep(2)
+    avail = mem_available_gib()
+    print(f"bench: {avail:.0f} GiB available after unload", file=sys.stderr)
+    return avail
+
+
+def mem_available_gib():
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1048576.0
+    except OSError:
+        return None
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", default=os.environ.get("BENCH_BASE_URL", "http://127.0.0.1:5830"))
@@ -181,6 +222,10 @@ def main():
     ap.add_argument("--nonce", default=None, help="pin the cache-busting nonce (default: unique per run)")
     ap.add_argument("--label", default="", help="free-form label written into the JSON")
     ap.add_argument("--out", default="", help="write the raw samples + summary as JSON here")
+    ap.add_argument("--unload-first", action="store_true",
+                    help="POST to llama-swap /api/models/unload and wait for RAM before measuring")
+    ap.add_argument("--swap-url", default=os.environ.get("SWAP_URL", "http://127.0.0.1:8080"),
+                    help="llama-swap base URL used by --unload-first")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--allow-cache", action="store_true", help="do not fail prefill cases that hit the prefix cache")
     args = ap.parse_args()
@@ -190,6 +235,9 @@ def main():
     unknown = [c for c in names if c not in CASES]
     if unknown:
         sys.exit(f"unknown case(s) {unknown}; known: {list(CASES)}")
+
+    if args.unload_first:
+        free_resident(args.swap_url, args.api_key)
 
     # One cheap warm-up request: first call after a load pays page-in and kernel
     # module load, which is not what any later measurement should include.
