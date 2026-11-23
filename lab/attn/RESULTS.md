@@ -8,7 +8,7 @@ Raw logs: `logs/`. No third-party code is used (llama.cpp is cited for the math 
 ## Verdict
 
 - **Correct**: 56 of 56 test cases pass against a double-precision CPU reference, max error 2.3e-3 absolute on outputs of scale about 2.5 (relative to max|o|: below 1e-3, rms-relative about 5e-4, set by f16 Q/KV/P rounding). No NaN anywhere, including sink +/-40.
-- **Decode**: a single split-K kernel reaches **200-221 GB/s** of K+V read on contexts of 32K and above (the measured ceiling for these boxes is 215-242 GB/s, notes/D). Per visit: 0.61-0.69 ms at 32K, 3.7-3.9 ms at 200K, 19-21 ms at 1M. SWA visit (1024 keys) is latency bound at 27-33 us. The decode speed is about the same as llama.cpp's FA vec kernel on the shapes it can run (it also hits about 225 GB/s). Our win is that bias, sink, SWA ring, clip/norm prologue and gate are in-kernel instead of a dense per-head mask tensor.
+- **Decode**: a single split-K kernel reaches **200-221 GB/s** of K+V read on contexts of 32K and above (the measured ceiling for these boxes is 215-242 GB/s). Per visit: 0.61-0.69 ms at 32K, 3.7-3.9 ms at 200K, 19-21 ms at 1M. SWA visit (1024 keys) is latency bound at 27-33 us. The decode speed is about the same as llama.cpp's FA vec kernel on the shapes it can run (it also hits about 225 GB/s). Our win is that bias, sink, SWA ring, clip/norm prologue and gate are in-kernel instead of a dense per-head mask tensor.
 - **Prefill**: WMMA flash kernel, **21-24 TFLOPS useful** on global layers at prefix 4K-32K, 15-17 TFLOPS on SWA layers (bias on every key). U=512 at prefix 32K: 9.7 ms per global visit; SWA visit 0.40 ms.
 - Biggest single finding: **grid order matters 4x for decode** (see "What was tried").
 
@@ -33,7 +33,7 @@ Mapping to Gufo (`rows_per_chunk = 256`, so a chunk is 512 KiB per component and
 - Global visits: two `kAppendRows` components (K, V) per visit, kernel base pointer + `cell*2048`, valid if the visit's `mem::Region` is one contiguous mapping (per the Gufo documentation, one Region per visit). If chunks are separate allocations, the kernels need a chunk pointer table (`chunk[cell>>8] + (cell&255)*1024`): one extra lookup per key row. Not implemented here (trivial but untested).
 - SWA visits: `kWindowRows`, `window_rows = 1024`, Gufo's minimum ring is `1024 + 256 - 1 = 1279` rows. That is enough for decode (<= 4 drafts) and for prefill ubatches of at most **256** rows (needs `1023 + U` cells). For ubatch 512 the adapter must pick a ring of 1536 rows (6 chunks); the API says "at least", so this should be allowed (not verified in Gufo source).
 - Open: whether Gufo's ring row index equals `pos % ring_rows`. If it uses another rule, only the one-line `cell(pos)` function changes.
-- Per-token bytes: 4096 B per visit; 8 global visits = 32 KiB/token (matches notes/B s3).
+- Per-token bytes: 4096 B per visit; 8 global visits = 32 KiB/token.
 - A q8_0 KV variant was **not built**; as decode is bandwidth bound the expected gain is about 1.9x on long contexts (17,408 vs 32,768 B/token over 8 visits) minus dequant cost. Unmeasured.
 
 ## API summary (what the runner calls)

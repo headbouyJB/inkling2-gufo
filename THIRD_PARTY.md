@@ -80,7 +80,7 @@ SOFTWARE.
 
 ## src/hip/kernels.hip, src/engine.cpp (M1 forward pass)
 - Dequantisation of NVFP4, Q8_0, Q5_0, Q4_K, Q5_K, Q6_K, IQ4_NL and IQ4_XS blocks, the `kvalues_fp4` / `kvalues_iq4nl` tables, `ggml_ue4m3_to_fp32` and `get_scale_min_k4` are re-implemented as HIP device functions from `ggml/src/ggml-quants.c`, `ggml-common.h` and `ggml-impl.h` (llama.cpp e412c6f, MIT). The `kvalues_fp4` / `kvalues_iq4nl` tables are copied data and `scale_min_k4` mirrors `get_scale_min_k4` (see above); the rest is written out in our own structure (item-wise dequantisation into registers).
-- The forward pass (block attention residual `mix`, `control`, `convolve`, `clip`, relative-bias attention with sink, SITU MoE, loop schedule and slot layout) follows `src/models/inkling2.cpp` and `src/models/inkling2-loop.cpp` (llama.cpp e412c6f + 29b52d3, MIT) as described in `notes/B-forward-spec.md`; no source was copied.
+- The forward pass (block attention residual `mix`, `control`, `convolve`, `clip`, relative-bias attention with sink, SITU MoE, loop schedule and slot layout) follows `src/models/inkling2.cpp` and `src/models/inkling2-loop.cpp` (llama.cpp e412c6f + 29b52d3, MIT) and re-implemented from those sources; no source was copied.
 - `tests/oracle/llama_dump.cpp` links libllama (llama.cpp e412c6f + the PR #32704 cherry-pick, MIT) as the numerical oracle.
 
 ## src/vision/ (vision encoder)

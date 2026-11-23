@@ -1,5 +1,5 @@
 // Inkling 2 Mini attention lab kernels for gfx1151 (wave32, WMMA f16). MIT.
-// Exact math: notes/B-forward-spec.md 2.2 C-D. Layout: K and V caches are f16 [cell][8 kv heads][128] (one cell = one
+// Layout: K and V caches are f16 [cell][8 kv heads][128] (one cell = one
 // 2 KiB row per tensor = one Gufo kAppendRows/kWindowRows row). Cell of position p is p % cap (cap >= max ctx for global
 // layers, >= 1024 + max ubatch for SWA ring layers).
 //

@@ -1,5 +1,5 @@
 // Inkling 2 Mini forward pass on HIP (milestone M1: simple, correct, slow).
-// Implements notes/B-forward-spec.md sections 2-3: 48 layer visits per token (24 physical
+// Implements the forward pass: 48 layer visits per token (24 physical
 // layers, the core layers 6..17 applied three times), block attention residuals, loop message
 // controllers, short convolutions, content-conditioned relative-bias attention with sinks,
 // sigmoid-routed MoE and the softcapped LM head. F32 activations; weights stay in their file
@@ -130,8 +130,8 @@ public:
 
   /// DSpark feature taps. While enabled, Forward also copies to the device the hidden state
   /// ENTERING the three tapped visits and the final post-output_norm hidden — the four features
-  /// notes/B-forward-spec.md section 4 says the drafter's context injection consumes. Kept on the
-  /// device so it costs no synchronisation, unlike the debug Tap hook.
+  /// the drafter's context injection consumes. Kept on the device so it costs no synchronisation,
+  /// unlike the debug Tap hook.
   void EnableDraftFeatures(bool on);
   /// The four taps of the last Forward, tap order, n_embd floats each (empty when disabled).
   [[nodiscard]] std::vector<float> DraftFeatures() const;

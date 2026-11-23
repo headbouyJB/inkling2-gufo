@@ -42,8 +42,8 @@ Build: `src/vision/vision_encoder.hip` is one HIP translation unit; `vision_imag
    1280x720 -> 32x18 = 576 tokens.
 2. **Patchify + normalise** (GPU, `k_patchify`): padding pixels are -1 *in 0..255 units*, then
    `(v - 127.5) / 127.5` is applied to everything, so padding ends up at about -1.0078 rather than exactly -1.
-   This is what mtmd does ("including negative padding", `mtmd-image.cpp:2172-2182`); the notes
-   (B-forward-spec 2.8) say "pad with -1", which is the same thing up to that 0.8 % detail. Patches are
+   This is what mtmd does ("including negative padding", `mtmd-image.cpp:2172-2182`); the reference
+   says "pad with -1", which is the same thing up to that 0.8 % detail. Patches are
    raster order over the patch grid; each patch vector is (channel, y, x) = the GGUF layout of
    `v.patch_embd.weight` (ne = 20,20,3,1024).
 3. **Patch embedding**: Linear 1200 -> 1024 (no bias), F32 weights, exact FP32 GEMM.
@@ -83,7 +83,7 @@ Prompt layout, verified by running mtmd's tokenizer on `<|message_user|><__media
   `<|content_image|>`, N x `<|unused_200054|>` placeholders, `<|end_message|>`, and **substitute the embedding of each
   placeholder with row k of `r.embd`**. The placeholder id itself is irrelevant to the compute.
 * The rows are used **as-is, un-normed**: text tokens go through `token_embd` then `token_embd_norm` (RMS);
-  image rows skip both (B-forward-spec 2.1, `inkling2.cpp:263-268`).
+  image rows skip both (`inkling2.cpp:263-268`).
 * **Positions are consecutive**, one per row (mtmd: `n_pos = n_tokens`, decoder pos `pos_0 + k` for row k; not
   M-RoPE, no 2-D positions), and attention is **causal** (`mtmd_decode_use_non_causal` = 0). The `<|end_message|>`
   after the image is a normal token at `pos_0 + N`.

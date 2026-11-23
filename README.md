@@ -327,7 +327,6 @@ extension.json, extension.cmake   manifest and build targets
 src/                              provider, runner, engine, cache adapter, HIP kernels (src/hip), text front-end (src/text), vision (src/vision)
 tests/                            probe/weights tests, text goldens, cache and oracle tools, vision tools
 tools/                            dev-loop and smoke scripts (parameterised by environment variables, see BUILD.md)
-notes/B-forward-spec.md          the forward-pass specification the engine implements
 lab/                              research kernels and their measurement logs; not part of the build
                                   (only `lab32`/`lab64` take `--gguf PATH`; `lab2`-`lab4` read a fixed default path and the attention lab no GGUF; see lab/RESULTS.md)
 docs/dev/                         development logs (M1 to M5), with the measurements this README cites

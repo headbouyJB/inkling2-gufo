@@ -22,7 +22,7 @@ UD-Q4_K_XL file at batch 1 (lab/RESULTS.md), so the GB/s column is a lower bound
 for the bandwidth the kernel actually achieves.
 
 Sibling of tools/prof_decode.py (which predates `_e`-suffixed MoE kernel names
-and only does the last N decode steps). This one is what notes/perf/map.md uses.
+and only does the last N decode steps). This one is the full per-stage map.
 """
 import argparse
 import collections

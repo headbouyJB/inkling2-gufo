@@ -3,7 +3,8 @@
 // The drafter is a separate small artifact: 3 dense layers (block size 8, non-causal inside the
 // block) plus a recurrent "markov" head that turns the block into chained draft tokens. It reads
 // the *target's* embedding table and output matrix, so it is bound next to an Inkling2Weights and
-// never on its own. See notes/B-forward-spec.md section 4 for the graph and the file's provenance.
+// never on its own. The graph follows the extension's `dflash` drafter arch and the config the file
+// declares.
 //
 // This file binds and validates; the forward pass lives in dspark_forward.cpp so a load problem
 // never looks like a numerics problem.

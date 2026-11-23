@@ -57,7 +57,7 @@ So the "image path for extensions" exists; the only gap is that the host does no
   encodes it), copies the rows to request-owned device memory and passes the overlap of each pass with each image as `InputRows`.
 * **Engine hook** (`src/engine.hpp/.cpp`, +20 lines, M5 hook markers). `Forward(..., std::span<const InputRows> rows = {})`: after
   `token_embd` + `token_embd_norm`, rows `[first, first+count)` of the call are overwritten (`hipMemcpyAsync` device to device) with the given rows. They
-  are used as they are (not normed), as the notes say (B-forward-spec 2.1; llama.cpp `inkling2.cpp` takes embeddings as `inpL` before the norm). A call with rows
+  are used as they are (not normed), as llama.cpp does (`inkling2.cpp` takes embeddings as `inpL` before the norm). A call with rows
   never takes the single-token decode fast path. `Decode*` and `src/hip/` are untouched.
 * **Template** (`src/text/chat_template.*`): `RenderOptions::image_counts` (per-image placeholder counts); 11 new checks in `text_tests`
   (8,354 pass).

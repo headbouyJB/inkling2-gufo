@@ -25,7 +25,7 @@ Usage:
   tests/perf/bench.py                                   # :5830, 2 reps
   tests/perf/bench.py --base-url http://127.0.0.1:8080 --reps 3 --label swap
   tests/perf/bench.py --cases prefill-4k,decode-1k     # subset while iterating
-  tests/perf/bench.py --out notes/perf/baseline.json   # keep the raw samples
+  tests/perf/bench.py --out bench-baseline.json        # keep the raw samples
 
 The prompt text is generated from a fixed word list with a seeded RNG, so the
 same --seed gives byte-identical prompts across builds; the per-run nonce is the
