@@ -541,29 +541,52 @@ __device__ __forceinline__ float block_sum(float v, float* red /*[32]*/) {
 }
 
 
-// post-conv + residual: out = (x + w . history) * scale; block: blk = cur, cur = out; else cur += out.
-__device__ __forceinline__ void conv_resid_elem(const ConvResidArgs& a, int c, int tok = 0) {
-  const size_t to = (size_t)tok * 2304;
-  float* st = a.slot[tok * 48].conv + (size_t)a.conv_off * 3 + (size_t)c * 3;
-  float xc;
+// conv input of one channel of batch row `tok` (summing nsum partial rows when nsum > 1).
+__device__ __forceinline__ float conv_in_elem(const ConvResidArgs& a, int tok, int c) {
   if (a.nsum == 8) {
     float v[8];
 #pragma unroll
     for (int e = 0; e < 8; ++e) v[e] = a.x[((size_t)tok * 8 + e) * 2304 + c];
-    xc = 0.f;
+    float s = 0.f;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) xc += v[e];
-  } else if (a.nsum > 1) {
-    xc = 0.f;
-    for (int e = 0; e < a.nsum; ++e) xc += a.x[((size_t)tok * a.nsum + e) * 2304 + c];
-  } else {
-    xc = a.x[to + c];
+    for (int e = 0; e < 8; ++e) s += v[e];
+    return s;
   }
-  const float xin[4] = {st[0], st[1], st[2], xc};
+  if (a.nsum > 1) {
+    float s = 0.f;
+    for (int e = 0; e < a.nsum; ++e) s += a.x[((size_t)tok * a.nsum + e) * 2304 + c];
+    return s;
+  }
+  return a.x[(size_t)tok * 2304 + c];
+}
+
+// post-conv + residual: out = (x + w . history) * scale; block: blk = cur, cur = out; else cur += out.
+__device__ __forceinline__ void conv_resid_elem(const ConvResidArgs& a, int c, int tok = 0) {
+  const size_t to = (size_t)tok * 2304;
+  float* st = a.slot[tok * a.slot_stride].conv + (size_t)a.conv_off * 3 + (size_t)c * 3;
+  float xin[4];
+  if (a.chain) {
+    // Consecutive positions of one session: the window before row tok is rows tok-3..tok-1 of this
+    // launch, falling back to the state the previous step left behind.
+    for (int i = 0; i < 3; ++i) {
+      const int j = tok - 3 + i;
+      xin[i] = j >= 0 ? conv_in_elem(a, j, c) : st[i];
+    }
+  } else {
+    xin[0] = st[0]; xin[1] = st[1]; xin[2] = st[2];
+  }
+  xin[3] = conv_in_elem(a, tok, c);
   float y = 0.f;
 #pragma unroll
   for (int i = 0; i < 4; ++i) y += a.w[(size_t)c * 4 + i] * xin[i];
-  st[0] = xin[1]; st[1] = xin[2]; st[2] = xin[3];
+  if (a.chain) {
+    if (a.snap != nullptr) {
+      float* sn = a.snap + (size_t)tok * a.snap_stride + (size_t)a.conv_off * 3 + (size_t)c * 3;
+      sn[0] = xin[1]; sn[1] = xin[2]; sn[2] = xin[3];
+    }
+  } else {
+    st[0] = xin[1]; st[1] = xin[2]; st[2] = xin[3];
+  }
   const float o = (xin[3] + y) * a.scale;
   const float cv = a.cur[to + c];
   if (a.blk) {
@@ -578,26 +601,22 @@ __device__ __forceinline__ void conv_resid_elem(const ConvResidArgs& a, int c, i
 __device__ __forceinline__ void conv_resid_block(const ConvResidArgs& a, int tok) {
   constexpr int R = 5;  // ceil(2304 / 512)
   const size_t to = (size_t)tok * 2304;
-  const SlotEntry* sl = a.slot + tok * 48;
+  const SlotEntry* sl = a.slot + tok * a.slot_stride;
   float xin[R][4], wv[R][4], cv[R];
 #pragma unroll
   for (int r = 0; r < R; ++r) {
     const int c = threadIdx.x + r * 512;
     if (c < 2304) {
       const float* st = sl->conv + (size_t)a.conv_off * 3 + (size_t)c * 3;
-      xin[r][0] = st[0]; xin[r][1] = st[1]; xin[r][2] = st[2];
-      float xc;
-      if (a.nsum == 8) {
-        float v[8];
-#pragma unroll
-        for (int e = 0; e < 8; ++e) v[e] = a.x[((size_t)tok * 8 + e) * 2304 + c];
-        xc = 0.f;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) xc += v[e];
+      if (a.chain) {
+        for (int i = 0; i < 3; ++i) {
+          const int j = tok - 3 + i;
+          xin[r][i] = j >= 0 ? conv_in_elem(a, j, c) : st[i];
+        }
       } else {
-        xc = a.x[to + c];
+        xin[r][0] = st[0]; xin[r][1] = st[1]; xin[r][2] = st[2];
       }
-      xin[r][3] = xc;
+      xin[r][3] = conv_in_elem(a, tok, c);
 #pragma unroll
       for (int i = 0; i < 4; ++i) wv[r][i] = a.w[(size_t)c * 4 + i];
       cv[r] = a.cur[to + c];
@@ -611,7 +630,14 @@ __device__ __forceinline__ void conv_resid_block(const ConvResidArgs& a, int tok
       float y = 0.f;
 #pragma unroll
       for (int i = 0; i < 4; ++i) y += wv[r][i] * xin[r][i];
-      st[0] = xin[r][1]; st[1] = xin[r][2]; st[2] = xin[r][3];
+      if (a.chain) {
+        if (a.snap != nullptr) {
+          float* sn = a.snap + (size_t)tok * a.snap_stride + (size_t)a.conv_off * 3 + (size_t)c * 3;
+          sn[0] = xin[r][1]; sn[1] = xin[r][2]; sn[2] = xin[r][3];
+        }
+      } else {
+        st[0] = xin[r][1]; st[1] = xin[r][2]; st[2] = xin[r][3];
+      }
       const float o = (xin[r][3] + y) * a.scale;
       if (a.blk) {
         a.blk[to + c] = cv[r];
@@ -625,6 +651,25 @@ __device__ __forceinline__ void conv_resid_block(const ConvResidArgs& a, int tok
 __global__ void __launch_bounds__(256) k_conv_resid(ConvResidArgs a) {
   const int c = blockIdx.x * 256 + threadIdx.x;
   if (c < 2304) conv_resid_elem(a, c, blockIdx.z);
+}
+
+// Finalises a chained batch's conv state: the last three inputs of concat(old, rows 0..nrows-1).
+__global__ void __launch_bounds__(256) k_conv_state_rows(const float* __restrict__ x,
+                                                        float* __restrict__ state, int row_stride,
+                                                        int nsum, int nrows, int C) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  float h[3] = {state[(size_t)c * 3], state[(size_t)c * 3 + 1], state[(size_t)c * 3 + 2]};
+  for (int t = 0; t < nrows; ++t) {
+    float xc = 0.f;
+    for (int e = 0; e < nsum; ++e) xc += x[(size_t)t * row_stride + (size_t)e * C + c];
+    h[0] = h[1];
+    h[1] = h[2];
+    h[2] = xc;
+  }
+  state[(size_t)c * 3] = h[0];
+  state[(size_t)c * 3 + 1] = h[1];
+  state[(size_t)c * 3 + 2] = h[2];
 }
 
 // Attention-residual mix, one block (16 waves) per query row. Optional prologue: the previous
@@ -807,13 +852,26 @@ __global__ void __launch_bounds__(128) k_kvprep(KvPrepArgs a) {
   const int kvh = blockIdx.x, d = threadIdx.x, c = kvh * 128 + d;
   const int tk = blockIdx.z;
   const int pos = a.pos[tk];
-  const SlotEntry* slot = a.slot + tk * 48;
+  const SlotEntry* slot = a.slot + tk * a.slot_stride;
   const float* ak = a.k + (size_t)tk * a.ld;
   const float* av = a.v + (size_t)tk * a.ld;
   float* sk = slot->conv + (size_t)a.conv_off_k * 3 + (size_t)c * 3;
   float* sv = slot->conv + (size_t)a.conv_off_v * 3 + (size_t)c * 3;
-  float kx[4] = {sk[0], sk[1], sk[2], ak[c]};
-  float vx[4] = {sv[0], sv[1], sv[2], av[c]};
+  float kx[4], vx[4];
+  if (a.chain) {
+    // Rows of this batch are consecutive positions of one session: the conv window before row tk is
+    // rows tk-3..tk-1 of the same launch, falling back to the previous step's state.
+    for (int i = 0; i < 3; ++i) {
+      const int j = tk - 3 + i;
+      kx[i] = j >= 0 ? ak[(size_t)j * a.ld + c] : sk[i];
+      vx[i] = j >= 0 ? av[(size_t)j * a.ld + c] : sv[i];
+    }
+    kx[3] = ak[c];
+    vx[3] = av[c];
+  } else {
+    kx[0] = sk[0]; kx[1] = sk[1]; kx[2] = sk[2]; kx[3] = ak[c];
+    vx[0] = sv[0]; vx[1] = sv[1]; vx[2] = sv[2]; vx[3] = av[c];
+  }
   float ky = 0.f, vy = 0.f;
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -829,8 +887,19 @@ __global__ void __launch_bounds__(128) k_kvprep(KvPrepArgs a) {
       vy += dv[kvh * 4 + lag] * vx[3 - lag];
     }
   }
-  sk[0] = kx[1]; sk[1] = kx[2]; sk[2] = kx[3];
-  sv[0] = vx[1]; sv[1] = vx[2]; sv[2] = vx[3];
+  if (a.chain) {
+    // Every row records the state after itself (distinct addresses, no race); the state of the slot is
+    // finalised afterwards by ConvStateRows, once no row is still reading it.
+    if (a.snap != nullptr) {
+      float* ks = a.snap + (size_t)tk * a.snap_stride + (size_t)a.conv_off_k * 3 + (size_t)c * 3;
+      float* vs = a.snap + (size_t)tk * a.snap_stride + (size_t)a.conv_off_v * 3 + (size_t)c * 3;
+      ks[0] = kx[1]; ks[1] = kx[2]; ks[2] = kx[3];
+      vs[0] = vx[1]; vs[1] = vx[2]; vs[2] = vx[3];
+    }
+  } else {
+    sk[0] = kx[1]; sk[1] = kx[2]; sk[2] = kx[3];
+    sv[0] = vx[1]; sv[1] = vx[2]; sv[2] = vx[3];
+  }
   const float kc = (kx[3] + ky) * a.scale, vc = (vx[3] + vy) * a.scale;
   const float kss = block_sum(kc * kc, red);
   const float vss = block_sum(vc * vc, red);
@@ -1128,7 +1197,7 @@ __global__ __launch_bounds__(NW * 32) void attn_decode(AttnArgs a) {
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
   const int kvh = blockIdx.x, split = blockIdx.y, tk = blockIdx.z;
   const int p0 = a.pos[tk];
-  const SlotEntry* slot = a.slot + tk * 48;
+  const SlotEntry* slot = a.slot + tk * a.slot_stride;
   const float* aq_ = a.q + (size_t)tk * a.ldp;
   const float* ar_ = a.r + (size_t)tk * a.ldp;
   float* ws_o = a.ws_o + (size_t)tk * a.ws_tok * 128;
@@ -2041,6 +2110,12 @@ void AttnDecode(hipStream_t s, const AttnArgs& a, int nb) {
 void ConvResid(hipStream_t s, const ConvResidArgs& a, int nb) {
   k_conv_resid<<<dim3(9, 1, nb), 256, 0, s>>>(a);
   Chk("conv_resid");
+}
+void ConvStateRows(hipStream_t s, const float* x, float* state, int row_stride, int nsum, int nrows,
+                   int channels) {
+  k_conv_state_rows<<<(channels + 255) / 256, 256, 0, s>>>(x, state, row_stride, nsum, nrows,
+                                                          channels);
+  Chk("conv_state_rows");
 }
 void Prefetch(hipStream_t s, const PrefetchJob& j, float* sink, int blocks) {
   k_prefetch<<<blocks, 256, 0, s>>>(j, sink);

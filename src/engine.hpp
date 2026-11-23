@@ -151,6 +151,13 @@ public:
   void Forward(Session& s, std::span<const std::int32_t> tokens, const LogitsSink& sink = {},
                const PrefillYield* yield = nullptr, std::span<const InputRows> rows = {});
 
+  /// Evaluates `tokens` (2..kMaxVerify, consecutive positions of one session) with the batched
+  /// DECODE kernels as one step, delivering each position's logits to `sink`. Requires
+  /// EnableVerify(s, tokens.size()). Afterwards the session is at pos + n with the conv state of the
+  /// last position; call RewindVerified to keep only an accepted prefix. This is the cost that makes
+  /// speculation pay — Forward() on a short span runs the prefill kernels and carries a ~65 ms floor.
+  void Verify(Session& s, std::span<const std::int32_t> tokens, const LogitsSink& sink);
+
   /// Waits for all queued device work (M2: the cache adapter copies state with hipMemcpy).
   void Synchronize();
 

@@ -80,6 +80,16 @@ struct ConvResidArgs {
   float* cur;
   float* blk;  // may be null
   int nsum = 0;  // > 1: x holds [nb][nsum][2304] partial rows that are added in slot order first
+  // Speculative verify: every row of the launch belongs to ONE session, so the slot entry must not
+  // advance per row (slot_stride = 0) and the conv recurrence chains across the rows of this batch
+  // instead of continuing from the previous step's state. chain = 0 is the shipped decode path.
+  int slot_stride = 48;
+  int nrows = 1;
+  int chain = 0;
+  // chain: [nrows][snap_stride] floats; the conv state after each row is written here (at
+  // conv_off*3 + c*3) so a partial acceptance can rewind, and the state itself is left alone.
+  float* snap = nullptr;
+  int snap_stride = 0;
 };
 /// Batched (nb tokens): x, cur, blk are [nb][2304]; token b uses slot[b * 48].
 void ConvResid(hipStream_t s, const ConvResidArgs& a, int nb = 1);
@@ -150,11 +160,24 @@ struct KvPrepArgs {
   const int* pos;
   float scale, qk_thr, eps;
   int ld = 0, ldd = 0;  // token strides of k / v and of dk / dv (decode batches); slot advances 48 entries per token
+  // See ConvResidArgs: chain = 1 keeps every row on one slot and chains the K/V conv across rows.
+  int slot_stride = 48;
+  int nrows = 1;
+  int chain = 0;
+  float* snap = nullptr;
+  int snap_stride = 0;
 };
+
+/// Writes the conv state of `channels` channels after `nrows` rows of a batched launch: the last
+/// three inputs of concat(old state, rows), i.e. exactly what the chain-mode rows have consumed.
+/// Row `t` starts at x + t * row_stride and, when nsum > 1, sums nsum rows of `channels`.
+void ConvStateRows(hipStream_t s, const float* x, float* state, int row_stride, int nsum, int nrows,
+                   int channels);
 void KvPrep(hipStream_t s, const KvPrepArgs& a, int nb = 1);
 
 struct AttnArgs {
   const SlotEntry* slot;
+  int slot_stride = 48;  // 0 during a verify pass: every row is another position of one session
   const int* pos;
   const float* q;       // [24][128] raw
   const float* r;       // [24][16] raw

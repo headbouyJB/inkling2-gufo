@@ -81,34 +81,68 @@ Two things fall out:
 So the verify path must run the **decode** kernels (`DLayer` / `k_gemv_multi`, which already handles
 up to 4 rows — that is exactly what `DecodeBatch` does in 48.0 ms), not the prefill kernels.
 
+## The fix that landed: `Engine::Verify` on the decode kernels
+
+`DecodeN` already runs up to 4 rows per weight pass, each with its own slot table entry and its own
+position. A verify pass is the same shape with two differences: every row is another *position of
+one session* (so the slot entry must not advance per row), and the conv recurrences must chain
+*within* the batch rather than continue from the previous step's state.
+
+So: `slot_stride` (48 for a decode batch, 0 for a verify pass) on `KvPrepArgs`, `AttnArgs` and
+`ConvResidArgs`; a `chain` mode in `k_kvprep` and in `conv_resid_elem` / `conv_resid_block` that
+takes the window before row `tk` from rows `tk-3..tk-1` of the same launch, falling back to the
+state only for the rows that precede the block; per-row conv snapshots written to the same
+`[visit][row][6656][3]` buffer `RewindVerified` reads; and `fs::ConvStateRows` to finalise the
+slot's state from the last three rows once no row still reads it (the main kernel cannot write it —
+rows 0..2 are reading it concurrently).
+
+Widths, 1024-token context, same build:
+
+| verify path | width 2 | width 3 | width 4 |
+| --- | --- | --- | --- |
+| `Forward` (prefill kernels) | 68.3 | — | 78.4-86.4 |
+| `Verify` (decode kernels) | **30.9** | **43.2** | **43.2** |
+| `DecodeBatch` of that many sessions | 31.9 | 40.6 | 48.0 |
+
+`Verify` at width 4 (43.2 ms) is *faster* than four independent sessions (48.0 ms) because the
+weights are read once for a single slot, and 2x faster than the same span through `Forward`. The
+self-test stays `verify:identical` on the new path, and the batched decode regression gate is
+exactly unchanged: `max |dlogit| 0.000e+00`, argmax agree 32/32, 48/48, 64/64 for B=2,3,4.
+
 ## Corrected economics
 
 Verify-4 priced at the decode-kernel cost (48.0 ms) instead of the prefill cost (78-86 ms), drafter
 ~10 ms per round, four tokens per round:
 
+With the measured `Verify` cost of 43.2 ms for four rows and a ~10 ms drafter per round:
+
 | acceptance | tokens/round | round | tok/s |
 | --- | --- | --- | --- |
-| 50 % | 2.50 | 58 ms | 43 (no gain) |
-| 76 % (Swift MTP, measured on this box) | 3.28 | 58 ms | **57** |
-| 90 % | 3.70 | 58 ms | 64 |
-| 100 % | 4.00 | 58 ms | 69 |
+| 50 % | 2.50 | 53 ms | 47 (no gain) |
+| 67 % | 3.00 | 53 ms | 57 |
+| 76 % (Swift MTP, measured on this box) | 3.28 | 53 ms | **62** |
+| 90 % | 3.70 | 53 ms | 70 |
+| 100 % | 4.00 | 53 ms | 75 |
 
-And through the current `Forward`-based verifier the same 76 % case is 3.28 tokens / 96 ms =
-**34 tok/s — a 25 % regression against the 45 tok/s baseline.** That is the state of the branch
-today: correct, but not shippable until the verify path is moved onto the decode kernels.
+The verifier alone, with a free drafter, is 4 / 43.2 ms = **93 tok/s** at 100 % acceptance; that is
+the hard ceiling for any drafter on this file and it is reached only if every draft is accepted
+every round. A narrower block does not help: width 2 costs 30.9 ms and returns 1+a tokens, i.e.
+49 tok/s at a=0.76 against width 4's 62.
 
-The ~92 tok/s "4-token ceiling" in `RESULTS.md` was `DecodeBatch`'s 48.0 ms read as if it were a
-verifier cost; the correct ceiling for a decode-kernel verifier is 4 tokens / 48.0 ms = 83 tok/s at
-100 % acceptance, before the drafter.
+So the earlier "100 tok/s is out of reach" conclusion survives, but its margin was wrong in the
+useful direction: DSpark on this file lands around **62 tok/s at the acceptance Unsloth's own MTP
+reaches on this box (76 %)**, a 1.4x gain over the 45 tok/s baseline, and it needs no new weights.
+Above that, acceptance is the only lever left — 100 tok/s needs 4 accepted drafts every round with a
+free drafter, which no drafter achieves.
 
 ## Next step, in order
 
-1. **Verify on the decode kernels** (`kMaxVerify` rows, one session, causal): `DLayer` already
-   batches 4 rows of `k_gemv_multi` and already writes per-session KV at `pos0`; the work is the
-   per-row KV write and the per-row attention extent `[0, pos0 + i]` so row `i` sees rows `0..i`.
-   Target 48 ms for a 4-token verify. This is worth ~1.7x on every DSpark round and is the
-   precondition for the drafter being worth writing at all.
-2. Only then the drafter (pieces 1-4 of `dspark-feasibility.md`) and the manifest/flag plumbing.
+1. ~~Verify on the decode kernels~~ — done above (43.2 ms at width 4).
+2. The drafter itself: pieces 1-4 of `dspark-feasibility.md` (dflash GGUF loader, the non-causal
+   3-block 8-row forward with target-feature injection at visits 5/23/41/48, the markov head chain,
+   then `Engine::Verify` + `RewindVerified` around it).
+3. Plumbing: manifest option, `--dspark-model` (already parsed by `gufo serve`), llama-swap entry,
+   and session sizing for the drafter's own KV (`verify_snapshot_bytes()` is already accounted).
 
 ## Reproduce
 

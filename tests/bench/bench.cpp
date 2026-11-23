@@ -38,7 +38,7 @@
 
 int main(int argc, char** argv) {
   std::string model, text, ids_in, ctxs = "64,4096", batches, spec;
-  bool verify = false, same = false;
+  bool verify = false, same = false, spec_forward = false;
   int decode = 64;
   unsigned ctx = 32768;
   for (int i = 1; i < argc; ++i) {
@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
     else if (k == "--batch") batches = next();
     else if (k == "--verify") verify = true;
     else if (k == "--spec") spec = next();
+    else if (k == "--specF") { spec = next(); spec_forward = true; }
     else if (k == "--same") same = true;  // identical prompts in all sessions (debug)
     else if (k == "--ctx") ctx = static_cast<unsigned>(std::strtoul(next().c_str(), nullptr, 10));
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
@@ -240,10 +241,12 @@ int main(int argc, char** argv) {
         }
         std::vector<std::vector<float>> rows(toks.size());
         const auto t1 = std::chrono::steady_clock::now();
-        engine->Forward(*sp, toks, [&](std::size_t first, std::size_t count, const float* data) {
+        auto sink = [&](std::size_t first, std::size_t count, const float* data) {
           for (std::size_t i = 0; i < count; ++i)
             rows[first + i].assign(data + i * V, data + (i + 1) * V);
-        });
+        };
+        if (spec_forward) engine->Forward(*sp, toks, sink);
+        else engine->Verify(*sp, toks, sink);
         std::size_t a = 0;  // matched drafts
         while (a < static_cast<std::size_t>(K) && argmax(rows[a]) == toks[a + 1]) ++a;
         const auto t2 = std::chrono::steady_clock::now();
@@ -258,9 +261,10 @@ int main(int argc, char** argv) {
       const bool ok = got.size() >= refseq.size() &&
                       std::equal(refseq.begin(), refseq.end(), got.begin());
       const double per_round = ms / static_cast<double>(rounds);
-      std::printf("spec K=%d ctx %6d  accept %5.1f%%  %6.2f ms/round  %4.2f tok/round  "
+      std::printf("spec%s K=%d ctx %6d  accept %5.1f%%  %6.2f ms/round  %4.2f tok/round  "
                   "%6.2f tok/s  verify:%s\n",
-                  K, C, 100.0 * static_cast<double>(accepted) / static_cast<double>(drafted),
+                  spec_forward ? "F" : "V", K, C,
+                  100.0 * static_cast<double>(accepted) / static_cast<double>(drafted),
                   per_round, static_cast<double>(got.size()) / static_cast<double>(rounds),
                   1000.0 / per_round * static_cast<double>(got.size()) / static_cast<double>(rounds),
                   ok ? "identical" : "MISMATCH");

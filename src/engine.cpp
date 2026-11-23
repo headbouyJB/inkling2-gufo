@@ -294,6 +294,14 @@ struct Engine::Impl {
       *d_dyn, *d_ob, *d_ao, *d_h, *d_mixf, *d_hn, *d_moe, *d_rlog, *d_wts8, *d_act8, *d_ws_o, *d_ws_m,
       *d_ws_l;
   static constexpr int kMaxB = 4;  // sessions per decode batch
+  // Speculative verify: every row of the step is a consecutive position of ONE session, so the slot
+  // entry must not advance per row (slot_stride 0) and the convs chain inside the batch instead of
+  // continuing from the previous step's state. chain = 0 is the shipped decode path.
+  int slot_stride = 48;
+  int chain = 0;
+  float* vsnap = nullptr;  // the verify session's per-visit conv snapshots (EnableVerify)
+  int vsnap_t = 0;
+  float* vconv[48] = {};  // host pointers of the verify session's 48 conv states
   // token strides (floats) of the decode buffers
   static constexpr int kSIn = 3 * kEmbd;    // d_in, d_mixed
   static constexpr int kSCtl = 4 * kEmbd;   // d_ctl, d_msgs
@@ -986,10 +994,28 @@ struct Engine::Impl {
   struct Pending {
     bool on = false;
     fs::ConvResidArgs a{};
+    float* conv = nullptr;  // host conv state of this site's visit (only the chain path needs it)
+    int off = 0;
   } pend;
+
+  /// Snapshot slice of one layer visit: [vsnap_t][6656][3] holding the conv state after each row.
+  [[nodiscard]] float* SnapOf(int visit) const {
+    if (!chain || vsnap == nullptr) return nullptr;
+    return vsnap + static_cast<std::size_t>(visit) * vsnap_t * kConvChannels * 3;
+  }
+
+  /// After a chained batch, the conv state of the site is the last three inputs of the batch.
+  void ConvFinalize(const float* x, float* conv, int off, int nsum) {
+    if (!chain || conv == nullptr) return;
+    const int rs = nsum > 1 ? nsum * kEmbd : kEmbd;
+    fs::ConvStateRows(ds, x, conv + static_cast<std::size_t>(off) * 3, rs, nsum > 1 ? nsum : 1, nb,
+                      kEmbd);
+  }
+
   void FlushPending() {
     if (!pend.on) return;
     fs::ConvResid(ds, pend.a, nb);
+    ConvFinalize(pend.a.x, pend.conv, pend.off, pend.a.nsum);
     pend.on = false;
   }
 
@@ -1014,7 +1040,10 @@ struct Engine::Impl {
         FlushPending();
       }
     }
+    const bool absorbed = mj.has_cr != 0;
+    const fs::ConvResidArgs cr = mj.cr;
     fs::Mix(ds, mj, cfg->rms_eps);
+    if (absorbed) ConvFinalize(cr.x, pend.conv, pend.off, cr.nsum);
   }
 
   float* NewBlock() {
@@ -1189,7 +1218,18 @@ struct Engine::Impl {
       ka.eps = cfg->rms_eps;
       ka.ld = kSProj;
       ka.ldd = 64;
+      ka.slot_stride = slot_stride;
+      ka.nrows = nb;
+      ka.chain = chain;
+      ka.snap = SnapOf(slot_idx);
+      ka.snap_stride = kConvChannels * 3;
       fs::KvPrep(ds, ka, nb);
+      if (chain) {  // the K/V conv state is the last three rows of this chained batch
+        fs::ConvStateRows(ds, Kb, vconv[slot_idx] + static_cast<std::size_t>(kConvOffK) * 3, kSProj, 1,
+                          nb, kKV);
+        fs::ConvStateRows(ds, Vb, vconv[slot_idx] + static_cast<std::size_t>(kConvOffV) * 3, kSProj, 1,
+                          nb, kKV);
+      }
     }
 
     Mark("kvprep");
@@ -1197,6 +1237,7 @@ struct Engine::Impl {
     {
       fs::AttnArgs aa{};
       aa.slot = slot;
+      aa.slot_stride = slot_stride;
       aa.pos = pos;
       aa.q = Qb;
       aa.r = Rb;
@@ -1241,12 +1282,19 @@ struct Engine::Impl {
       ca.scale = 1.0f / std::sqrt(5.0f);
       ca.cur = cur;
       ca.blk = nullptr;
+      ca.slot_stride = slot_stride;
+      ca.nrows = nb;
+      ca.chain = chain;
+      ca.snap = SnapOf(slot_idx);
+      ca.snap_stride = kConvChannels * 3;
       if (ip % static_cast<int>(cfg->attn_res_block) == 0) {
         ca.blk = NewBlock();
         d_states[d_ns++] = ca.blk;
       }
       pend.on = true;
       pend.a = ca;
+      pend.conv = vconv[slot_idx];
+      pend.off = kConvOffAttn;
     }
     Mark("oproj_conv");
 
@@ -1321,8 +1369,15 @@ struct Engine::Impl {
       ca.scale = 1.0f / std::sqrt(5.0f);
       ca.cur = cur;
       ca.blk = nullptr;
+      ca.slot_stride = slot_stride;
+      ca.nrows = nb;
+      ca.chain = chain;
+      ca.snap = SnapOf(slot_idx);
+      ca.snap_stride = kConvChannels * 3;
       pend.on = true;
       pend.a = ca;
+      pend.conv = vconv[slot_idx];
+      pend.off = kConvOffFfn;
     }
     Mark("moe_dn_tail");
     if (pf_proj_bytes > 0 && visit_no + 1 < static_cast<int>(visit_ip.size())) {
@@ -1788,6 +1843,70 @@ void Engine::DecodeBatch(std::span<Session* const> sessions, std::span<const std
     return;
   }
   for (std::size_t i = 0; i < sessions.size(); ++i) impl_->Decode(*sessions[i], tokens[i], &sessions[i]->logits_);
+}
+
+void Engine::Verify(Session& s, std::span<const std::int32_t> tokens, const LogitsSink& sink) {
+  const std::size_t n = tokens.size();
+  if (n < 2 || n > kMaxVerify) throw std::runtime_error("inkling2: verify width must be 2..4");
+  const std::lock_guard lock(mutex_);
+  if (!impl_->BatchCapable())
+    throw std::runtime_error("inkling2: verify needs the batched decode path");
+  if (s.pos_ + n > max_context_) throw std::runtime_error("inkling2: context exhausted");
+  if (s.snap_ == nullptr || s.snap_t_ < static_cast<int>(n))
+    throw std::runtime_error("inkling2: Verify without EnableVerify");
+  for (auto t : tokens)
+    if (t < 0 || static_cast<std::uint32_t>(t) >= weights_.config.n_vocab_text)
+      throw std::runtime_error("inkling2: token id out of range");
+  if (s.hooks_ != nullptr) s.hooks_->BeforeWrite(s.pos_, s.pos_ + n);  // M2 hook
+
+  Impl& im = *impl_;
+  const auto nb = static_cast<int>(n);
+  im.nb = nb;
+  std::int32_t step[2 * Impl::kMaxB] = {};
+  int maxpos = 0;
+  for (std::size_t b = 0; b < n; ++b) {
+    step[b] = tokens[b];
+    step[Impl::kMaxB + b] = static_cast<int>(s.pos_) + static_cast<int>(b);
+    maxpos = std::max(maxpos, step[Impl::kMaxB + b]);
+  }
+  const int ctx = im.BucketCtx(maxpos);
+  // Chain mode: one session, slot entries fixed, convs chained inside the batch, conv states
+  // snapshotted per row so a rejected suffix can be dropped by RewindVerified.
+  im.slot_stride = 0;
+  im.chain = 1;
+  im.vsnap = s.snap_;
+  im.vsnap_t = nb;
+  for (std::size_t i = 0; i < 48; ++i) im.vconv[i] = s.slots_[i].conv;
+  struct Restore {  // leave the engine in the shipped decode configuration whatever happens
+    Impl* i;
+    ~Restore() {
+      i->slot_stride = 48;
+      i->chain = 0;
+      i->vsnap = nullptr;
+      i->vsnap_t = 0;
+      i->nb = 1;
+    }
+  } restore{&im};
+
+  Check(hipStreamSynchronize(im.s), "pre-verify sync");
+  Check(hipMemcpyAsync(im.d_step, step, sizeof step, hipMemcpyHostToDevice, im.ds), "step");
+  for (std::size_t b = 0; b < n; ++b)
+    Check(hipMemcpyAsync(im.d_tbl + b * 48, s.tbl_, 48 * sizeof(fs::SlotEntry),
+                         hipMemcpyDeviceToDevice, im.ds),
+          "slot table");
+  im.BuildDecode(ctx);  // eager: captured graphs bake per-session snapshot pointers
+  const std::size_t V = weights_.config.n_vocab_text;
+  std::vector<float> row(V);
+  for (std::size_t b = 0; b < n; ++b) {
+    Check(hipMemcpyAsync(row.data(), im.logits_d + b * V, V * 4, hipMemcpyDeviceToHost, im.ds),
+          "logits copy");
+    Check(hipStreamSynchronize(im.ds), "verify logits sync");
+    if (sink) sink(b, 1, row.data());
+    if (b + 1 == n) s.logits_ = row;
+  }
+  im.ProfFlush();
+  s.verify_pos_ = s.pos_;  // RewindVerified counts from here
+  s.pos_ += n;
 }
 
 void Engine::Synchronize() {
