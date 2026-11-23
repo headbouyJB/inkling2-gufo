@@ -128,6 +128,14 @@ public:
   /// false when max_draft is out of range; nothing else makes it fail.
   bool EnableVerify(Session& s, std::size_t max_draft);
 
+  /// DSpark feature taps. While enabled, Forward also copies to the device the hidden state
+  /// ENTERING the three tapped visits and the final post-output_norm hidden — the four features
+  /// notes/B-forward-spec.md section 4 says the drafter's context injection consumes. Kept on the
+  /// device so it costs no synchronisation, unlike the debug Tap hook.
+  void EnableDraftFeatures(bool on);
+  /// The four taps of the last Forward, tap order, n_embd floats each (empty when disabled).
+  [[nodiscard]] std::vector<float> DraftFeatures() const;
+
   /// Ends a verify round after its Forward: drops the snapshots and keeps the model state as if
   /// only the first `accepted` (1..n) draft positions had been evaluated. KV needs no restore:
   /// rows the rejected drafts wrote are at or above the new position, and no read addresses a row

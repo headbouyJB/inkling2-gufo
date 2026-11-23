@@ -177,3 +177,16 @@ That matches `notes/B-forward-spec.md` section 4 field for field, including the 
 graph depends on: `sample_from_anchor=0` (row 0 is the anchor, so at most 7 draft tokens) and
 `has_confidence_head=0` (no p_min gate). `joint_proj` is `ne=[5120, 768]` on disk =
 `[state(256) + markov(256) + h(2304) + ctx(2304)] -> 3 x 256`, which confirms the chain layout.
+
+## Feature taps for the drafter's context injection
+
+`Engine::EnableDraftFeatures(true)` copies to the device, during a Forward, the hidden state
+**entering** visits 5 / 23 / 41 and the final post-`output_norm` hidden — the four `target_layers`
+features `dspark-feasibility.md` needs. Device-side, so unlike the debug `SetTap` hook it costs no
+synchronisation on the decode path (the hook syncs and copies 9 KiB per visit to the host);
+`DraftFeatures()` reads the four rows back once per draft round. Inert unless enabled: the flag
+short-circuits before the copy, which is why the verify and batched-decode gates below are unchanged.
+
+Still to come for task-5: the drafter forward (3-layer non-causal 8-row block with context
+injection, per-head q/k norm + RoPE, then the markov chain and `lm_head` correction), then the
+manifest option + `--dspark-model` plumbing and llama-swap entry.

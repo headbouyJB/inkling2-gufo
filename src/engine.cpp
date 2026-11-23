@@ -266,6 +266,16 @@ struct Engine::Impl {
   std::vector<int> visit_ip;  // physical layer of every visit of the step being built
   int visit_no = 0;
   float* d_pf_sink = nullptr;
+  // DSpark feature taps (see EnableDraftFeatures): [4][kEmbd], the three visit inputs plus the
+  // final normed hidden. The visits come from the drafter's target_layers.
+  float* d_feat = nullptr;
+  bool feat_on = false;
+  std::array<int, 4> tap_visit{5, 23, 41, 48};
+  void MaybeFeat(const float* src, int visit) {
+    if (!feat_on || d_feat == nullptr) return;
+    for (int k = 0; k < 4; ++k)
+      if (visit == tap_visit[k]) kk::Copy(s, src, d_feat + static_cast<std::size_t>(k) * kEmbd, kEmbd);
+  }
   // F16 copies of the F32 loop-controller and router weights for the decode GEMVs (half the bytes;
   // INKLING2_CTL_F32=1 keeps F32). Prefill keeps using the F32 originals.
   bool ctl_half = true;
@@ -1604,6 +1614,7 @@ struct Engine::Impl {
     if (fast_prefill) UploadDenseItems();
     int visit = 0;
     for (int ip = 0; ip < static_cast<int>(cfg->core_start); ++ip) {
+      MaybeFeat(cur, visit);
       Layer(ss, ip, ip, nullptr);
       Tap(visit++, "l_out");
       MaybeYield(yr, true);  // M2 hook
@@ -1622,6 +1633,7 @@ struct Engine::Impl {
       }
       for (int ip = static_cast<int>(cfg->core_start); ip < static_cast<int>(cfg->core_end);
            ++ip) {
+        MaybeFeat(cur, visit);
         if (pass == 0) {
           Layer(ss, ip, ip, nullptr);
         } else {
@@ -1649,6 +1661,7 @@ struct Engine::Impl {
     // output: attention-residual mix, norm, lm head, soft cap, crop
     kk::Mix(s, States(cur), DF(w->output_res_query), 1, kEmbd, T, mixf, cfg->rms_eps);
     kk::RmsNorm(s, mixf, kEmbd, DF(w->output_norm), hn, kEmbd, kEmbd, T, cfg->rms_eps);
+    MaybeFeat(hn, tap_visit[3]);
     const int V = static_cast<int>(cfg->n_vocab_text);
     auto chunk = [&](int a, int n, std::vector<float>* host) {
       G(w->output, hn + static_cast<std::size_t>(a) * kEmbd, kEmbd, logits_d, V, n, V);
@@ -1907,6 +1920,22 @@ void Engine::Verify(Session& s, std::span<const std::int32_t> tokens, const Logi
   im.ProfFlush();
   s.verify_pos_ = s.pos_;  // RewindVerified counts from here
   s.pos_ += n;
+}
+
+void Engine::EnableDraftFeatures(bool on) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  if (on && impl_->d_feat == nullptr)
+    impl_->d_feat = static_cast<float*>(AllocDevice(4 * kEmbd * 4, "draft features"));
+  impl_->feat_on = on;
+}
+
+std::vector<float> Engine::DraftFeatures() const {
+  if (impl_->d_feat == nullptr || !impl_->feat_on) return {};
+  std::vector<float> out(4 * kEmbd);
+  Check(hipMemcpy(out.data(), impl_->d_feat, out.size() * 4, hipMemcpyDeviceToHost),
+        "draft features copy");
+  return out;
 }
 
 void Engine::Synchronize() {
