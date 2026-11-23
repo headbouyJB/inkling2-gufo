@@ -7,6 +7,7 @@ gufo_extension_target(
   SOURCES
     src/config.cpp
     src/weights.cpp
+    src/dspark.cpp
     src/probe.cpp
     src/extension.cpp
     src/text/chat_template.cpp

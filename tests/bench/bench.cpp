@@ -33,11 +33,12 @@
 
 #include <gufo/ext/gguf_reader.hpp>
 
+#include "src/dspark.hpp"
 #include "src/engine.hpp"
 #include "text/tokenizer.hpp"
 
 int main(int argc, char** argv) {
-  std::string model, text, ids_in, ctxs = "64,4096", batches, spec;
+  std::string model, text, ids_in, ctxs = "64,4096", batches, spec, dspark_path;
   bool verify = false, same = false, spec_forward = false;
   int decode = 64;
   unsigned ctx = 32768;
@@ -52,6 +53,7 @@ int main(int argc, char** argv) {
     else if (k == "--batch") batches = next();
     else if (k == "--verify") verify = true;
     else if (k == "--spec") spec = next();
+    else if (k == "--dspark") dspark_path = next();  // bind and describe a drafter artifact, then exit
     else if (k == "--specF") { spec = next(); spec_forward = true; }
     else if (k == "--same") same = true;  // identical prompts in all sessions (debug)
     else if (k == "--ctx") ctx = static_cast<unsigned>(std::strtoul(next().c_str(), nullptr, 10));
@@ -93,6 +95,17 @@ int main(int argc, char** argv) {
   open.allow_unsized_tensors = true;
   std::shared_ptr<const gufo::core::GgufReader> reader = gufo::core::GgufReader::OpenFile(model, &err, open);
   if (!reader) { std::fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
+  if (!dspark_path.empty()) {
+    gufo::core::GgufOpenOptions dopen;
+    dopen.allow_unsized_tensors = true;
+    std::string derr;
+    auto dreader = gufo::core::GgufReader::OpenFile(dspark_path, &derr, dopen);
+    if (!dreader) { std::fprintf(stderr, "dspark open: %s\n", derr.c_str()); return 1; }
+    auto w = gufo::models::inkling2::DsparkWeights::Bind(*dreader, &derr);
+    if (!w) { std::fprintf(stderr, "dspark bind: %s\n", derr.c_str()); return 1; }
+    std::printf("%s\n", gufo::models::inkling2::DescribeDspark(*w).c_str());
+    return 0;
+  }
   auto engine = gufo::models::inkling2::Engine::Create(reader, ctx, &err);
   if (!engine) { std::fprintf(stderr, "engine: %s\n", err.c_str()); return 1; }
   auto session = engine->NewSession();

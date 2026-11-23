@@ -159,3 +159,21 @@ inkling2_bench … --ctxs 2,4,8,16,32,64,128,256 --decode 1
 inkling2_bench … --ctxs 1024 --decode 16 --batch 2,3,4
 INKLING2_PROFILE_PREFILL=1 inkling2_bench … --ctxs 4,64 --decode 1
 ```
+
+## Piece 1 landed: the drafter artifact binds
+
+`src/dspark.{hpp,cpp}` binds the `dflash` artifact and validates it against the config it declares:
+all 54 tensors with exact ggml `ne` shapes, every type checked against the extension's supported
+set, the layer count, block size, tap count/order, non-causal flag, and a refusal of any unclaimed
+tensor (so a converter change cannot pass silently). `inkling2_bench --dspark FILE` binds and
+describes it and exits:
+
+```
+dspark: layers=3 block=8 max_draft=7 embd=2304 ff=9216 head=24/8x128 rank=256
+        vocab=200058/201024 rope=1e+06 softcap=30 eps=1e-06 swa=101 taps=5,23,41,48 anchor=0
+```
+
+That matches `notes/B-forward-spec.md` section 4 field for field, including the two things the
+graph depends on: `sample_from_anchor=0` (row 0 is the anchor, so at most 7 draft tokens) and
+`has_confidence_head=0` (no p_min gate). `joint_proj` is `ne=[5120, 768]` on disk =
+`[state(256) + markov(256) + h(2304) + ctx(2304)] -> 3 x 256`, which confirms the chain layout.
