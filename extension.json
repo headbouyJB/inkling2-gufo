@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "inkling2",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "api_version": ">= 0.3.20",
   "entry": "inkling2_register",
   "registration_target": "gufo_inkling2",

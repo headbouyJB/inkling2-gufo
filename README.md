@@ -7,7 +7,7 @@ A [Gufo](https://github.com/gufo-org/gufo) model extension that runs Inkling 2 M
 It provides text generation, tool calls, reasoning control, image input (`--mmproj`), prefix caching
 with RAM and disk checkpoints, and several concurrent sessions, all through `gufo serve`.
 
-Status: version 0.1.3, development builds only. It was developed and measured on one machine class,
+Status: version 0.1.4, development builds only. It was developed and measured on one machine class,
 a Ryzen AI MAX+ 395 (gfx1151, 128 GiB), against Gufo v0.35.0 (`0260e11`), extension API 0.3.x. Nothing
 here has been tested on other GPUs or other Gufo versions. The dev logs behind every number below are in
 [docs/dev/](docs/dev/) and in the kernel lab notes ([lab/RESULTS.md](lab/RESULTS.md)).
@@ -185,7 +185,7 @@ gufo extension install https://github.com/headbouyJB/inkling2-gufo@<commit> --ye
 gufo extension list
 ```
 
-`gufo extension list` should then show a line like `inkling2 0.1.3 [installed, ready]`. `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag).
+`gufo extension list` should then show a line like `inkling2 0.1.4 [installed, ready]`. `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag).
 
 `--yes` skips Gufo's confirmation prompt for unreviewed sources; read the source first (it is native code that runs with your permissions).
 
@@ -358,6 +358,13 @@ Other limits:
 - Quality was measured as KL on 9,300 WikiText tokens and by suite results; there is no perplexity run through this engine and no
   benchmark of generated-text quality.
 - Only Gufo v0.35.0 was built with this extension. Gufo main (API 0.3.35) was read, not built.
+
+## Changes in 0.1.4
+
+- Faster prefill (PR #4 by vincentkelleher): tensor-core kernels for the loop controllers (f16 WMMA for the gain / forget apply, split-f16 WMMA for the down-projection) and a retiled F32 kernel for the router and the other small projections. Measured on this machine with `inkling2_bench`, prefill is 8.0 % faster at 512 tokens and 11.7 % to 13.0 % faster from 2,048 to 32,000 tokens (4K: 1,365 to 1,541 tok/s); decode is unchanged (within 0.2 %). Against the llama.cpp CPU reference over 4,096 WikiText tokens: mean KL 1.361e-3, top-1 98.29 % (0.1.3: 1.370e-3, 98.17 %). The Performance table above is still the 0.1.1 measurement.
+- Prefill chunks under 128 tokens keep the F32 kernels; chunks of 128 tokens or more take the f16 paths. So the same prompt can give very slightly different logits depending on how its prefill is split, for example a cache restore followed by a short tail against one prefill of the whole prompt. A 37-token prompt gave exactly the 0.1.3 output.
+- Weight upload through a pinned staging buffer (PR #6 by derptoolsmidland): a load could hang forever when host memory was full of page cache in active use (issue #2). It costs about a second per load when the model file is already in the page cache.
+- Manifest version 0.1.4.
 
 ## Changes in 0.1.3
 

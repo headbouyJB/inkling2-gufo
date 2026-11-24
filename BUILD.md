@@ -57,7 +57,7 @@ c() {
 
 ```sh
 gufo extension install https://github.com/headbouyJB/inkling2-gufo@<commit> --yes
-gufo extension list      # expect a line like: inkling2 0.1.3 [installed, ready]
+gufo extension list      # expect a line like: inkling2 0.1.4 [installed, ready]
 ```
 
 `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag). Gufo builds the module on your machine from that pinned source

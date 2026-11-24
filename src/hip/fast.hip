@@ -1483,8 +1483,9 @@ __device__ __forceinline__ uint64_t pack4l(float4 v) {
 
 
 
-// Tensor-core version of k_gate_p for the skinny F32 prefill matrices (router 128 rows, the 64-row
-// controller down-projection with per-segment RMS, the sink/relative-position "skinny" GEMM).
+// Tensor-core version of k_gate_p, used for the 64-row controller down-projection with per-segment
+// RMS (CtlPrefill, chunks of 128 tokens or more). The router and the sink / relative-position
+// "skinny" GEMMs stay on the F32 k_gate_p (see RouterPrefill).
 // 64 rows x 128 tokens per block, 32 warps (4 row groups of 16 x 8 token tiles), so the weight
 // tiles are read once per 128 tokens instead of once per 32 — that re-read was ~112 MB of L2
 // traffic per launch in the 32-token version. Weights AND activations are carried as split-f16
@@ -1567,12 +1568,12 @@ __global__ void __launch_bounds__(1024) k_gate_wh(GateJobs jobs, int T, float ep
 // k_ctl_apply_p with tensor cores. Same math as the SIMT version (out = x - tanh(Wf g64) x +
 // tanh(Wg g64) msg, K = 64) but the 2 304 x 64 gain/forget tiles are consumed as WMMA fragments:
 // the SIMT kernel moved ~10 MB of LDS per block for a 590 KFLOP/token operation, which is why it
-// sat at ~7 GFLOPS. Block: 32 tokens x 64 channels, 8 warps (4 row groups of 16 x 2 token tiles),
-// weights and activations staged as f16 in LDS (STR = 72 halves, no fragment bank conflicts).
+// sat at ~7 GFLOPS. Block: 128 tokens x 64 channels, 32 warps (4 row groups of 16 x 8 token
+// tiles), weights and activations staged as f16 in LDS (STR = 72 halves, no fragment bank
+// conflicts). Used for chunks of 128 tokens or more; shorter ones take k_ctl_apply_p.
 __global__ void __launch_bounds__(1024) k_ctl_apply_w(CtlPJobs jobs, int T) {
-  // 128 tokens per block (32 warps: 4 row groups of 16 x 8 token tiles) so the 2 304 x 64 gain /
-  // forget tiles are read once per 128 tokens; the 32-token version re-read them per tile, which
-  // was ~37 MB of L2 traffic per launch for a 590 KFLOP/token operation.
+  // 128 tokens per block so the 2 304 x 64 gain / forget tiles are read once per 128 tokens; the
+  // 32-token version re-read them per tile, which was ~37 MB of L2 traffic per launch.
   constexpr int STR = 72, TT = 128, ROWS = 64;
   const CtlPJob& p = jobs.j[blockIdx.z];
   __shared__ _Float16 wg[ROWS][STR], wf[ROWS][STR];
@@ -2489,9 +2490,10 @@ void CtlPrefill(hipStream_t s, const CtlPJobs& jobs, int t, float eps) {
     const CtlPJob& c = jobs.j[i];
     g.j[i] = {c.x, c.ldx, c.msg, c.ldm, c.down, 4608, 2304, 2304, 1, c.g64, 64, 0};
   }
-  // The 64-row down projection that produces g64 stays F32: f16 weights there move mean KL over
-  // 512 positions from 1.8e-4 to 1.5e-3 (g64 gates every channel through tanh), which is over the
-  // 1e-3 guardrail for a ~1.5 % prefill gain.
+  // The 64-row down projection that produces g64: chunks of 128 tokens or more use the split-f16
+  // WMMA kernel (~1e-6 relative error), shorter ones the F32 k_gate_p. Plain f16 weights here moved
+  // mean KL over 512 positions from 1.8e-4 to 1.5e-3 (g64 gates every channel through tanh), over
+  // the 1e-3 guardrail. The gain / forget apply follows the same 128-token split.
   if (t >= kGwTT) k_gate_wh<<<dim3((t + kGwTT - 1) / kGwTT, 1, jobs.n), 1024, 0, s>>>(g, t, eps);
   else k_gate_p<<<dim3((t + kGateTT - 1) / kGateTT, 1, jobs.n), 512, 0, s>>>(g, t, eps);
   if (t >= 128) k_ctl_apply_w<<<dim3((t + 127) / 128, 36, jobs.n), 1024, 0, s>>>(jobs, t);
@@ -2502,8 +2504,6 @@ void CtlPrefill(hipStream_t s, const CtlPJobs& jobs, int t, float eps) {
 void RouterPrefill(hipStream_t s, const float* w, const float* x, float* logits, int t) {
   GateJobs g{};
   g.j[0] = {x, 2304, nullptr, 0, w, 2304, 2304, 0, 0, logits, 128, 0};
-  // The router stays on the F32 kernel: f16 logits flip near-tie expert choices and that costs
-  // 7x more KL (1.4e-3 vs 1.8e-4 over 512 positions) than it saves time (~8 us/token).
   // The router stays F32: its logits go through a discrete top-8, so even a 1e-7 change of the
   // summation order flips near-tie experts and costs ~1e-3 KL (measured with both the f16 and the
   // split-f16 version of this GEMM).
