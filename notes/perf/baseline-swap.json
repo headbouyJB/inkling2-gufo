@@ -1,0 +1,110 @@
+{
+ "label": "0.1.4 llama-swap as configured",
+ "base_url": "http://localhost:8080",
+ "model": "inkling-2-mini",
+ "nonce": "1795552705-1246677",
+ "seed": 1234,
+ "reps": 2,
+ "cases": [
+  "prefill-4k",
+  "decode-short",
+  "decode-4k"
+ ],
+ "median": {
+  "prefill-4k": 1529.5,
+  "decode-short": 49.2,
+  "decode-4k": 43.7
+ },
+ "summary": {
+  "prefill-4k": {
+   "metric": "prefill",
+   "tok_s": [
+    1544.6122901056963,
+    1514.4266427767498
+   ]
+  },
+  "decode-short": {
+   "metric": "decode",
+   "tok_s": [
+    49.581632854731694,
+    48.88211760217497
+   ]
+  },
+  "decode-4k": {
+   "metric": "decode",
+   "tok_s": [
+    43.73749315491575,
+    43.72583198539403
+   ]
+  }
+ },
+ "samples": {
+  "prefill-4k": [
+   {
+    "prompt_tokens": 4097,
+    "completion_tokens": 8,
+    "cached_tokens": 0,
+    "prefill_tps": 1544.6122901056963,
+    "decode_tps": 43.24022764639409,
+    "draft_tokens": 0,
+    "draft_tokens_accepted": 0,
+    "wall_s": 2.857
+   },
+   {
+    "prompt_tokens": 4097,
+    "completion_tokens": 8,
+    "cached_tokens": 0,
+    "prefill_tps": 1514.4266427767498,
+    "decode_tps": 43.6572591912651,
+    "draft_tokens": 0,
+    "draft_tokens_accepted": 0,
+    "wall_s": 2.907
+   }
+  ],
+  "decode-short": [
+   {
+    "prompt_tokens": 52,
+    "completion_tokens": 128,
+    "cached_tokens": 0,
+    "prefill_tps": 353.30159765496336,
+    "decode_tps": 49.581632854731694,
+    "draft_tokens": 25,
+    "draft_tokens_accepted": 16,
+    "wall_s": 2.734
+   },
+   {
+    "prompt_tokens": 52,
+    "completion_tokens": 128,
+    "cached_tokens": 0,
+    "prefill_tps": 353.2382666356424,
+    "decode_tps": 48.88211760217497,
+    "draft_tokens": 15,
+    "draft_tokens_accepted": 11,
+    "wall_s": 2.771
+   }
+  ],
+  "decode-4k": [
+   {
+    "prompt_tokens": 4096,
+    "completion_tokens": 128,
+    "cached_tokens": 0,
+    "prefill_tps": 1576.610300732668,
+    "decode_tps": 43.73749315491575,
+    "draft_tokens": 0,
+    "draft_tokens_accepted": 0,
+    "wall_s": 5.542
+   },
+   {
+    "prompt_tokens": 4096,
+    "completion_tokens": 128,
+    "cached_tokens": 0,
+    "prefill_tps": 1558.373868355437,
+    "decode_tps": 43.72583198539403,
+    "draft_tokens": 0,
+    "draft_tokens_accepted": 0,
+    "wall_s": 5.573
+   }
+  ]
+ },
+ "timestamp": "2026-11-24T20:39:01Z"
+}
