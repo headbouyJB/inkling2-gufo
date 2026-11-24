@@ -1,0 +1,114 @@
+{
+ "label": "entry dspark 4k",
+ "base_url": "http://localhost:8080",
+ "timestamp": "2026-11-24T21:34:41Z",
+ "reps": 2,
+ "depth": 4000,
+ "max_tokens": 128,
+ "workloads": {
+  "chat": {
+   "prompt_tokens": 3414,
+   "decode_tps": 42.8,
+   "draft_accepted": 9,
+   "draft_proposed": 24,
+   "samples": [
+    {
+     "prompt_tokens": 3414,
+     "decode_tps": 43.13047946530665,
+     "completion_tokens": 47,
+     "draft_accepted": 9,
+     "draft_proposed": 21,
+     "wall_s": 3.429,
+     "content_head": "A mixture-of-experts model is a machine learning architectur"
+    },
+    {
+     "prompt_tokens": 3414,
+     "decode_tps": 42.52297961496579,
+     "completion_tokens": 47,
+     "draft_accepted": 0,
+     "draft_proposed": 3,
+     "wall_s": 1.116,
+     "content_head": "A mixture-of-experts model is a machine learning architectur"
+    }
+   ]
+  },
+  "math": {
+   "prompt_tokens": 3419,
+   "decode_tps": 56.9,
+   "draft_accepted": 125,
+   "draft_proposed": 164,
+   "samples": [
+    {
+     "prompt_tokens": 3419,
+     "decode_tps": 52.25523127120253,
+     "completion_tokens": 128,
+     "draft_accepted": 54,
+     "draft_proposed": 76,
+     "wall_s": 3.597,
+     "content_head": "17*23 = 391\n144/12 = 12\n3^7 = 2187\n\nSteps:\n- 17*23: 17*20 = "
+    },
+    {
+     "prompt_tokens": 3419,
+     "decode_tps": 61.52744336363869,
+     "completion_tokens": 128,
+     "draft_accepted": 71,
+     "draft_proposed": 88,
+     "wall_s": 2.09,
+     "content_head": "17*23 = 391\n144/12 = 12\n3^7 = 2187\n\nSteps:\n- 17*23: 17*20 = "
+    }
+   ]
+  },
+  "code": {
+   "prompt_tokens": 3416,
+   "decode_tps": 48.7,
+   "draft_accepted": 55,
+   "draft_proposed": 89,
+   "samples": [
+    {
+     "prompt_tokens": 3416,
+     "decode_tps": 45.187635550978456,
+     "completion_tokens": 85,
+     "draft_accepted": 21,
+     "draft_proposed": 44,
+     "wall_s": 2.09,
+     "content_head": "def reverse_string(s):\n    \"\"\"\n    Reverses a string.\n\n    A"
+    },
+    {
+     "prompt_tokens": 3416,
+     "decode_tps": 52.19272022434769,
+     "completion_tokens": 85,
+     "draft_accepted": 34,
+     "draft_proposed": 45,
+     "wall_s": 1.639,
+     "content_head": "def reverse_string(s):\n    \"\"\"\n    Reverses a string.\n\n    A"
+    }
+   ]
+  },
+  "copy": {
+   "prompt_tokens": 3467,
+   "decode_tps": 89.1,
+   "draft_accepted": 87,
+   "draft_proposed": 87,
+   "samples": [
+    {
+     "prompt_tokens": 3467,
+     "decode_tps": 96.82745674943575,
+     "completion_tokens": 59,
+     "draft_accepted": 48,
+     "draft_proposed": 48,
+     "wall_s": 0.876,
+     "content_head": "The maintenance manual for the coastal weather station descr"
+    },
+    {
+     "prompt_tokens": 3467,
+     "decode_tps": 81.42211883802786,
+     "completion_tokens": 59,
+     "draft_accepted": 39,
+     "draft_proposed": 39,
+     "wall_s": 0.736,
+     "content_head": "The maintenance manual for the coastal weather station descr"
+    }
+   ]
+  }
+ }
+}

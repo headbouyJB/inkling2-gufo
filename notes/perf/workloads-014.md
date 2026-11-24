@@ -94,6 +94,32 @@ in a batch of 2+ takes no probe call and earns no credit, so the cost that
 remains is the feature taps. Settling it needs an `ab.sh` run of two images
 (drafter vs no drafter) with `--cases batch2-1k --reps 3`, not another table.
 
+## Through the llama-swap entry, with the drafter loaded
+
+The entry now runs `--speculative dspark --dspark-model /models/dspark/dspark-Inkling-2-Mini-Q8_0.gguf`
+(2 sessions, `--context 262144`, cache on, mmproj). Measured against it, same workloads and 4K of
+filler, 3 reps:
+
+| workload | entry, dspark (tok/s) | drafts acc/prop |
+| --- | --- | --- |
+| chat | 42.8 | 0/9 |
+| math | 61.9 | 213/264 |
+| code | 52.4 | 102/135 |
+| copy | 81.6 | 117/117 |
+
+`bench.py` on the same entry (pinned nonce): `prefill-4k` 1,554, `decode-4k` 48.1, `decode-short` 53.4
+— against 1,537 / 45.6 / 48.9 with the drafter absent.
+
+**Chat reads 42.8 here against 46.7 in the 32K-context table, and that is not speculation.** The
+same chat prompt on the same workload at `--ctx 262144` (1 session) reads 43.9 plain and 44.0 with the
+drafter: the whole difference is the entry's context configuration, and the drafter is neutral on chat
+(0/3 drafts on the entry run, 18/42 at 1 session 262K). So there is no lookup/drafter tax on chat to
+remove — the 262144 context and the 2-session state are what cost ~6 % of decode, and they were
+already being paid before this round.
+
+Entry-versus-standalone summary for the same prompt: 32K ctx 46.7 (plain) → 262144 ctx 43.9 (plain) →
+262144 ctx + drafter 44.0 (chat) / 59.8 (math) / 56.0 (code) / 97.8 (copy).
+
 ## Recommendation
 
 Keep the drafter's defaults; ship the drafter itself where the workload mix is
