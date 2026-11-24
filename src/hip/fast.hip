@@ -5,6 +5,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <type_traits>
 #include <stdexcept>
@@ -622,6 +623,95 @@ __device__ __forceinline__ void conv_resid_block(const ConvResidArgs& a, int tok
     }
   }
 }
+
+// ---- multi-row launches (0.1.3 Stage 2) --------------------------------------------------------------------
+// Several rows of one session at consecutive positions share a launch. Row m of a session reads the committed history
+// (the slot, never written during the launch) for the inputs before the launch and the RAW inputs of the session's
+// earlier rows of the launch (rows tok - 1, tok - 2, tok - 3 while m allows) for the rest: exactly the four inputs the
+// sequential decode would hold, computed by the same expressions, so the result is bit-identical. The state after this
+// row goes to the row's snapshot (RowInfo::snap) or, when the session has one row only, in place as before.
+__device__ __forceinline__ float conv_x_of(const ConvResidArgs& a, int tok, int c) {
+  float xc;
+  if (a.nsum == 8) {
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) v[e] = a.x[((size_t)tok * 8 + e) * 2304 + c];
+    xc = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) xc += v[e];
+  } else if (a.nsum > 1) {
+    xc = 0.f;
+    for (int e = 0; e < a.nsum; ++e) xc += a.x[((size_t)tok * a.nsum + e) * 2304 + c];
+  } else {
+    xc = a.x[(size_t)tok * 2304 + c];
+  }
+  return xc;
+}
+__device__ __forceinline__ void conv_resid_elem_mr(const ConvResidArgs& a, int c, int tok) {
+  const size_t to = (size_t)tok * 2304;
+  const RowInfo ri = a.rows[tok];
+  const float* st = a.slot[tok * 48].conv + (size_t)a.conv_off * 3 + (size_t)c * 3;
+  float xin[4];
+#pragma unroll
+  for (int i = 0; i < 3; ++i) xin[i] = (ri.m - 3 + i < 0) ? st[ri.m + i] : conv_x_of(a, tok - 3 + i, c);
+  xin[3] = conv_x_of(a, tok, c);
+  float y = 0.f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) y += a.w[(size_t)c * 4 + i] * xin[i];
+  float* so = ri.snap ? ri.snap + ((size_t)a.visit * 6656 + a.conv_off) * 3 + (size_t)c * 3 : const_cast<float*>(st);
+  so[0] = xin[1]; so[1] = xin[2]; so[2] = xin[3];
+  const float o = (xin[3] + y) * a.scale;
+  const float cv = a.cur[to + c];
+  if (a.blk) {
+    a.blk[to + c] = cv;
+    a.cur[to + c] = o;
+  } else {
+    a.cur[to + c] = cv + o;
+  }
+}
+__device__ __forceinline__ void conv_resid_block_mr(const ConvResidArgs& a, int tok) {
+  constexpr int R = 5;  // ceil(2304 / 512)
+  const size_t to = (size_t)tok * 2304;
+  const RowInfo ri = a.rows[tok];
+  const float* sl = a.slot[tok * 48].conv;
+  float xin[R][4], wv[R][4], cv[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    const int c = threadIdx.x + r * 512;
+    if (c < 2304) {
+      const float* st = sl + (size_t)a.conv_off * 3 + (size_t)c * 3;
+#pragma unroll
+      for (int i = 0; i < 3; ++i) xin[r][i] = (ri.m - 3 + i < 0) ? st[ri.m + i] : conv_x_of(a, tok - 3 + i, c);
+      xin[r][3] = conv_x_of(a, tok, c);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) wv[r][i] = a.w[(size_t)c * 4 + i];
+      cv[r] = a.cur[to + c];
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    const int c = threadIdx.x + r * 512;
+    if (c < 2304) {
+      float* so = ri.snap ? ri.snap + ((size_t)a.visit * 6656 + a.conv_off) * 3 + (size_t)c * 3
+                          : const_cast<float*>(sl) + (size_t)a.conv_off * 3 + (size_t)c * 3;
+      float y = 0.f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) y += wv[r][i] * xin[r][i];
+      so[0] = xin[r][1]; so[1] = xin[r][2]; so[2] = xin[r][3];
+      const float o = (xin[r][3] + y) * a.scale;
+      if (a.blk) {
+        a.blk[to + c] = cv[r];
+        a.cur[to + c] = o;
+      } else {
+        a.cur[to + c] = cv[r] + o;
+      }
+    }
+  }
+}
+__global__ void __launch_bounds__(256) k_conv_resid_mr(ConvResidArgs a) {
+  const int c = blockIdx.x * 256 + threadIdx.x;
+  if (c < 2304) conv_resid_elem_mr(a, c, blockIdx.z);
+}
 __global__ void __launch_bounds__(256) k_conv_resid(ConvResidArgs a) {
   const int c = blockIdx.x * 256 + threadIdx.x;
   if (c < 2304) conv_resid_elem(a, c, blockIdx.z);
@@ -629,12 +719,14 @@ __global__ void __launch_bounds__(256) k_conv_resid(ConvResidArgs a) {
 
 // Attention-residual mix, one block (16 waves) per query row. Optional prologue: the previous
 // op's post-conv + residual (single-row jobs); optional epilogue: RMS norm with weights.
+template <bool MR>
 __global__ void __launch_bounds__(512) k_mix(MixJob j, float eps) {
   __shared__ float sc[8], coef[8], red[16];
   const int q = blockIdx.x, tok = blockIdx.y, wave = threadIdx.x / 32, lane = threadIdx.x % 32;
   const size_t toff = (size_t)tok * 2304;
   if (j.has_cr) {
-    conv_resid_block(j.cr, tok);
+    if constexpr (MR) conv_resid_block_mr(j.cr, tok);
+    else conv_resid_block(j.cr, tok);
     __syncthreads();
   }
   const float* qv = j.query + (size_t)q * 2304;
@@ -802,6 +894,7 @@ __global__ void __launch_bounds__(256) k_tiny(TinyJobs j) {
 }
 
 // K/V conv (+ conv-state update), K clip / V rms, f16 KV write. One block per kv head.
+template <bool MR>
 __global__ void __launch_bounds__(128) k_kvprep(KvPrepArgs a) {
   __shared__ float red[32];
   const int kvh = blockIdx.x, d = threadIdx.x, c = kvh * 128 + d;
@@ -812,8 +905,27 @@ __global__ void __launch_bounds__(128) k_kvprep(KvPrepArgs a) {
   const float* av = a.v + (size_t)tk * a.ld;
   float* sk = slot->conv + (size_t)a.conv_off_k * 3 + (size_t)c * 3;
   float* sv = slot->conv + (size_t)a.conv_off_v * 3 + (size_t)c * 3;
-  float kx[4] = {sk[0], sk[1], sk[2], ak[c]};
-  float vx[4] = {sv[0], sv[1], sv[2], av[c]};
+  float kx[4], vx[4];
+  float *ok = sk, *ov = sv;  // where the state after this row goes
+  if constexpr (MR) {
+    // see conv_resid_elem_mr: the earlier rows of the session in this launch supply their raw inputs
+    const RowInfo ri = a.rows[tk];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      const bool hist = ri.m - 3 + i < 0;
+      kx[i] = hist ? sk[ri.m + i] : a.k[(size_t)(tk - 3 + i) * a.ld + c];
+      vx[i] = hist ? sv[ri.m + i] : a.v[(size_t)(tk - 3 + i) * a.ld + c];
+    }
+    kx[3] = ak[c];
+    vx[3] = av[c];
+    if (ri.snap) {
+      ok = ri.snap + ((size_t)a.visit * 6656 + a.conv_off_k) * 3 + (size_t)c * 3;
+      ov = ri.snap + ((size_t)a.visit * 6656 + a.conv_off_v) * 3 + (size_t)c * 3;
+    }
+  } else {
+    kx[0] = sk[0]; kx[1] = sk[1]; kx[2] = sk[2]; kx[3] = ak[c];
+    vx[0] = sv[0]; vx[1] = sv[1]; vx[2] = sv[2]; vx[3] = av[c];
+  }
   float ky = 0.f, vy = 0.f;
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -829,8 +941,8 @@ __global__ void __launch_bounds__(128) k_kvprep(KvPrepArgs a) {
       vy += dv[kvh * 4 + lag] * vx[3 - lag];
     }
   }
-  sk[0] = kx[1]; sk[1] = kx[2]; sk[2] = kx[3];
-  sv[0] = vx[1]; sv[1] = vx[2]; sv[2] = vx[3];
+  ok[0] = kx[1]; ok[1] = kx[2]; ok[2] = kx[3];
+  ov[0] = vx[1]; ov[1] = vx[2]; ov[2] = vx[3];
   const float kc = (kx[3] + ky) * a.scale, vc = (vx[3] + vy) * a.scale;
   const float kss = block_sum(kc * kc, red);
   const float vss = block_sum(vc * vc, red);
@@ -1113,8 +1225,12 @@ __global__ __launch_bounds__(NW * 32) void attn_decode(AttnArgs a) {
   const __half* vc = (const __half*)slot->v;
   const int cap = slot->cap;
   const int kb = a.swa ? max(0, p0 - (WIN - 1)) : 0;
-  const int lo = kb + split * a.chunk;
-  const int hi = min(lo + a.chunk, p0 + 1);
+  // Multi-row launch (global layers): this row splits by the bucket of its own position, as a single-token decode
+  // at that position would; splits beyond its own count have nothing to do.
+  const int chunk = a.rows ? a.rows[tk].chunk : a.chunk;
+  if (a.rows && split >= a.rows[tk].nsplit) return;
+  const int lo = kb + split * chunk;
+  const int hi = min(lo + chunk, p0 + 1);
   const __half* bt = (const __half*)a.bt;
 
   for (int r = w; r < 16; r += NW) {
@@ -1277,8 +1393,9 @@ __global__ __launch_bounds__(128) void decode_reduce(AttnArgs a) {
   const float* ws_m = a.ws_m + (size_t)tk * a.ws_tok;
   const float* ws_l = a.ws_l + (size_t)tk * a.ws_tok;
   const float sk = a.sink[tk * 24 + h];
+  const int nsplit = a.rows ? a.rows[tk].nsplit : a.nsplit;
   float mmax = sk;
-  for (int s = dim; s < a.nsplit; s += 128) {
+  for (int s = dim; s < nsplit; s += 128) {
     sc[s] = ws_m[((size_t)s * NKV + kvh) * 12 + r];
     mmax = fmaxf(mmax, sc[s]);
   }
@@ -1291,7 +1408,7 @@ __global__ __launch_bounds__(128) void decode_reduce(AttnArgs a) {
   __syncthreads();
   const float M = fmaxf(fmaxf(sred[0], sred[1]), fmaxf(sred[2], sred[3]));
   float zp = 0.f;
-  for (int s = dim; s < a.nsplit; s += 128) {
+  for (int s = dim; s < nsplit; s += 128) {
     const float ms = sc[s];
     const float e = (ms == -INFINITY) ? 0.f : __expf(ms - M);
     sc[s] = e;
@@ -1304,7 +1421,7 @@ __global__ __launch_bounds__(128) void decode_reduce(AttnArgs a) {
   const float Z = __expf(sk - M) + sred[0] + sred[1] + sred[2] + sred[3];
   float o = 0.f;
 #pragma unroll 8
-  for (int s = 0; s < a.nsplit; s++) o += sc[s] * ws_o[(((size_t)s * NKV + kvh) * 12 + r) * HD + dim];
+  for (int s = 0; s < nsplit; s++) o += sc[s] * ws_o[(((size_t)s * NKV + kvh) * 12 + r) * HD + dim];
   o /= Z;
   if (a.gate) o *= 1.0f / (1.0f + __expf(-a.gate[(size_t)tk * a.ldp + (size_t)h * HD + dim]));
   a.out[(size_t)tk * 3072 + (size_t)h * HD + dim] = o;
@@ -1827,25 +1944,46 @@ void ProjMulti(hipStream_t s, const ProjSpec& p, const float* x, int ni, float* 
     constexpr int RPB = BW * (WS / LPR) * NIT;
     mp.ntb = (trows_total + BW - 1) / BW;
     const dim3 grid((cum + RPB - 1) / RPB + mp.ntb);
-    if (nb == 1) {
-      if (ni == 1)
-        k_gemv_multi<2304, LPR, NIT, BW, 1><<<grid, BW * WS, 0, s>>>(mp, x, y, cum);
-      else
-        k_gemv_multi<2304, LPR, NIT, BW, 3><<<grid, BW * WS, 0, s>>>(mp, x, y, cum);
-    } else if (ni == 1) {
-      if (nb == 2) k_gemv_multi<2304, LPR, NIT, BW, 1, 2><<<grid, BW * WS, 0, s>>>(mp, x, y, cum);
-      else if (nb == 3) k_gemv_multi<2304, LPR, NIT, BW, 1, 3><<<grid, BW * WS, 0, s>>>(mp, x, y, cum);
-      else k_gemv_multi<2304, LPR, NIT, BW, 1, 4><<<grid, BW * WS, 0, s>>>(mp, x, y, cum);
-    } else {
-      // three inputs per token: 4 tokens would need more than 64 KiB of LDS, so they run as two pairs
-      if (nb == 2) k_gemv_multi<2304, LPR, NIT, BW, 3, 2><<<grid, BW * WS, 0, s>>>(mp, x, y, cum);
-      else if (nb == 3) k_gemv_multi<2304, LPR, NIT, BW, 3, 3><<<grid, BW * WS, 0, s>>>(mp, x, y, cum);
-      else {
-        MultiP mp2 = mp;
-        for (int i = 0; i < mp2.tn; ++i) mp2.ty[i] += 2 * (size_t)mp2.tys[i];
-        k_gemv_multi<2304, LPR, NIT, BW, 3, 2><<<grid, BW * WS, 0, s>>>(mp, x, y, cum);
-        k_gemv_multi<2304, LPR, NIT, BW, 3, 2><<<grid, BW * WS, 0, s>>>(mp2, x + 2 * (size_t)ldx, y + 2 * (size_t)ldy, cum);
+    // One launch of `n` tokens starting at token `t0` (tokens are independent: any split gives the same results).
+    auto launch = [&](int n, int t0) {
+      MultiP m2 = mp;
+      for (int i = 0; i < m2.tn; ++i) m2.ty[i] += (size_t)t0 * m2.tys[i];
+      const float* x2 = x + (size_t)t0 * ldx;
+      float* y2 = y + (size_t)t0 * ldy;
+      if (ni == 1) {
+        switch (n) {
+          case 1: k_gemv_multi<2304, LPR, NIT, BW, 1, 1><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+          case 2: k_gemv_multi<2304, LPR, NIT, BW, 1, 2><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+          case 3: k_gemv_multi<2304, LPR, NIT, BW, 1, 3><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+          case 4: k_gemv_multi<2304, LPR, NIT, BW, 1, 4><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+          default:
+            // 5..8 tokens (multi-row launches): only the default shape is instantiated
+            if constexpr (LPR == 16 && NIT == 4 && BW == 4) {
+              switch (n) {
+                case 5: k_gemv_multi<2304, LPR, NIT, BW, 1, 5><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+                case 6: k_gemv_multi<2304, LPR, NIT, BW, 1, 6><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+                case 7: k_gemv_multi<2304, LPR, NIT, BW, 1, 7><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+                default: k_gemv_multi<2304, LPR, NIT, BW, 1, 8><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+              }
+            } else {
+              throw std::runtime_error("inkling2 fast: more than 4 tokens need the default projection shape");
+            }
+        }
+      } else {
+        // three inputs per token: more than 3 tokens would need more than 64 KiB of LDS
+        switch (n) {
+          case 1: k_gemv_multi<2304, LPR, NIT, BW, 3, 1><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+          case 2: k_gemv_multi<2304, LPR, NIT, BW, 3, 2><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+          default: k_gemv_multi<2304, LPR, NIT, BW, 3, 3><<<grid, BW * WS, 0, s>>>(m2, x2, y2, cum); break;
+        }
       }
+    };
+    if (ni == 1 || nb <= 3) {
+      launch(nb, 0);
+    } else {
+      // 4 tokens run as two pairs (as in 0.1.2), 5..8 in groups of three (the last group 1..3)
+      const int step = nb == 4 ? 2 : 3;
+      for (int t0 = 0; t0 < nb; t0 += step) launch(std::min(step, nb - t0), t0);
     }
   };
   switch (g_tune[0]) {
@@ -1868,7 +2006,11 @@ void GemvQ8(hipStream_t s, int k, const void* w, const float* x, float* y, int m
       case 1: k_gemv<FMT_Q8, 2304, LPR, NIT, BW, 1><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
       case 2: k_gemv<FMT_Q8, 2304, LPR, NIT, BW, 2><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
       case 3: k_gemv<FMT_Q8, 2304, LPR, NIT, BW, 3><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
-      default: k_gemv<FMT_Q8, 2304, LPR, NIT, BW, 4><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      case 4: k_gemv<FMT_Q8, 2304, LPR, NIT, BW, 4><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      case 5: k_gemv<FMT_Q8, 2304, LPR, NIT, BW, 5><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      case 6: k_gemv<FMT_Q8, 2304, LPR, NIT, BW, 6><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      case 7: k_gemv<FMT_Q8, 2304, LPR, NIT, BW, 7><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      default: k_gemv<FMT_Q8, 2304, LPR, NIT, BW, 8><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
     }
   } else if (k == 3072) {
     constexpr int LPR = 16, NIT = 1, BW = 4, RPB = BW * (WS / LPR) * NIT;
@@ -1877,7 +2019,11 @@ void GemvQ8(hipStream_t s, int k, const void* w, const float* x, float* y, int m
       case 1: k_gemv<FMT_Q8, 3072, LPR, NIT, BW, 1><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
       case 2: k_gemv<FMT_Q8, 3072, LPR, NIT, BW, 2><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
       case 3: k_gemv<FMT_Q8, 3072, LPR, NIT, BW, 3><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
-      default: k_gemv<FMT_Q8, 3072, LPR, NIT, BW, 4><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      case 4: k_gemv<FMT_Q8, 3072, LPR, NIT, BW, 4><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      case 5: k_gemv<FMT_Q8, 3072, LPR, NIT, BW, 5><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      case 6: k_gemv<FMT_Q8, 3072, LPR, NIT, BW, 6><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      case 7: k_gemv<FMT_Q8, 3072, LPR, NIT, BW, 7><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
+      default: k_gemv<FMT_Q8, 3072, LPR, NIT, BW, 8><<<grid, BW * WS, 0, s>>>(W, x, y, m, softcap, g_res); break;
     }
   } else {
     throw std::runtime_error("inkling2 fast: unsupported gemv K");
@@ -1981,7 +2127,8 @@ void MoeDownE(hipStream_t s, int fmt, const void* w, const float* escale, const 
 }
 
 void Mix(hipStream_t s, const MixJob& j, float eps) {
-  k_mix<<<dim3(j.nq, j.ntok), 512, 0, s>>>(j, eps);
+  if (j.has_cr && j.cr.rows) k_mix<true><<<dim3(j.nq, j.ntok), 512, 0, s>>>(j, eps);
+  else k_mix<false><<<dim3(j.nq, j.ntok), 512, 0, s>>>(j, eps);
   Chk("mix");
 }
 void Rms(hipStream_t s, const NormJobs& j, float eps, int nb) {
@@ -2005,7 +2152,8 @@ void Tiny(hipStream_t s, const TinyJobs& j, int nb) {
   Chk("tiny");
 }
 void KvPrep(hipStream_t s, const KvPrepArgs& a, int nb) {
-  k_kvprep<<<dim3(8, 1, nb), 128, 0, s>>>(a);
+  if (a.rows) k_kvprep<true><<<dim3(8, 1, nb), 128, 0, s>>>(a);
+  else k_kvprep<false><<<dim3(8, 1, nb), 128, 0, s>>>(a);
   Chk("kvprep");
 }
 void AttnDecode(hipStream_t s, const AttnArgs& a, int nb) {
@@ -2014,7 +2162,8 @@ void AttnDecode(hipStream_t s, const AttnArgs& a, int nb) {
   Chk("attn_decode");
 }
 void ConvResid(hipStream_t s, const ConvResidArgs& a, int nb) {
-  k_conv_resid<<<dim3(9, 1, nb), 256, 0, s>>>(a);
+  if (a.rows) k_conv_resid_mr<<<dim3(9, 1, nb), 256, 0, s>>>(a);
+  else k_conv_resid<<<dim3(9, 1, nb), 256, 0, s>>>(a);
   Chk("conv_resid");
 }
 void Prefetch(hipStream_t s, const PrefetchJob& j, float* sink, int blocks) {

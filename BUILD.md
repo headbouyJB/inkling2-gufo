@@ -57,7 +57,7 @@ c() {
 
 ```sh
 gufo extension install https://github.com/headbouyJB/inkling2-gufo@<commit> --yes
-gufo extension list      # expect a line like: inkling2 0.1.2 [installed, ready]
+gufo extension list      # expect a line like: inkling2 0.1.3 [installed, ready]
 ```
 
 `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag). Gufo builds the module on your machine from that pinned source
@@ -221,3 +221,7 @@ already contains this extension, so we did not use it.
   `tools/compare_dumps.py` reports KL, top-1 agreement and per-range numbers.
 - `tools/serve-inner.sh` + `tools/smoke.py`: start `gufo serve llm` on 127.0.0.1:5830 in a GPU
   container, run a script against it, stop it. Run under `$GPU_RUN`.
+- DSpark drafter (0.1.3 step 2, `docs/dev/v013-dspark.md`): `tests/dspark/dspark_test.cpp` (target `inkling2_dspark_test`; modes
+  smoke, oracle, oracle-own, taps, probe, timing, ids, identity) and `tests/oracle/dspark_dump.cpp`, the pr390 side
+  (`PR390=<pr390 checkout with build-hip/> OUT=<dir> tools/build-dspark-dump.sh`, host compiler only; it writes the taps of every
+  position, pr390's drafts and logits). `tests/dspark/drive-dspark.sh` is the GPU driver (run it with nothing else using the GPU).

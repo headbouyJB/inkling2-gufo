@@ -23,6 +23,18 @@ struct SlotEntry {
   int pad;
 };
 
+/// 0.1.3 Stage 2: one row of a multi-row decode launch (several rows may belong to one session, at consecutive
+/// positions). Device array indexed by the token (row) index of the launch. Null `rows` pointers in the kernel
+/// arguments below select the classic one-row-per-session behaviour (conv history updated in place).
+struct RowInfo {
+  int m;       // index of this row within its session's rows of the launch (0 for the first)
+  int chunk;   // global attention: split size of the bucket of THIS row's own position
+  int nsplit;  // global attention: number of splits of that bucket
+  int pad;
+  float* snap;  // null: the session has one row in the launch, its conv history is updated in place.
+                // else [48 visits][6656][3]: the state after this row is written here (the slot is not touched)
+};
+
 enum Fmt : int { kFmtQ8 = 0, kFmtNvfp4 = 1 };
 
 /// Kernel variant selectors for benchmarking (0 = default); see fast.hip.
@@ -80,6 +92,8 @@ struct ConvResidArgs {
   float* cur;
   float* blk;  // may be null
   int nsum = 0;  // > 1: x holds [nb][nsum][2304] partial rows that are added in slot order first
+  const RowInfo* rows = nullptr;  // multi-row launch (see RowInfo); null: classic
+  int visit = 0;                  // visit index (only with `rows`: where the row's snapshot of this visit lives)
 };
 /// Batched (nb tokens): x, cur, blk are [nb][2304]; token b uses slot[b * 48].
 void ConvResid(hipStream_t s, const ConvResidArgs& a, int nb = 1);
@@ -150,6 +164,8 @@ struct KvPrepArgs {
   const int* pos;
   float scale, qk_thr, eps;
   int ld = 0, ldd = 0;  // token strides of k / v and of dk / dv (decode batches); slot advances 48 entries per token
+  const RowInfo* rows = nullptr;  // multi-row launch: row b chains its conv history on the raw inputs of its earlier rows
+  int visit = 0;
 };
 void KvPrep(hipStream_t s, const KvPrepArgs& a, int nb = 1);
 
@@ -172,6 +188,7 @@ struct AttnArgs {
   float qk_thr, r_thr, tau_floor, tau_alpha;
   int ldp = 0;     // token stride of q / r / gate (decode batches); out is [nb][3072], sink [nb][24]
   int ws_tok = 0;  // token stride of ws_m / ws_l (floats); ws_o is ws_tok * 128
+  const RowInfo* rows = nullptr;  // multi-row launch, global layers: every row splits by the bucket of its own position
 };
 void AttnDecode(hipStream_t s, const AttnArgs& a, int nb = 1);
 

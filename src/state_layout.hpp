@@ -79,7 +79,8 @@ public:
   [[nodiscard]] std::vector<cache::BackingClass> BackingPlan(std::size_t ram_bytes) const;
   /// Bytes one checkpoint at `position` adds to the cache (rows it keeps + private state).
   [[nodiscard]] std::size_t CheckpointBytes(std::size_t position) const;
-  /// Device bytes of one session for `context` tokens (matches Engine::session_bytes()).
+  /// Device bytes of one session for `context` tokens: KV rows and the conv history. Engine::session_bytes() adds the conv
+  /// snapshots of an engine created with lookup (Engine::kMaxRows regions); this layout does not know them.
   [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const;
   [[nodiscard]] std::size_t PrivateBytes() const;
 

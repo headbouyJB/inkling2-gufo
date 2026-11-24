@@ -7,7 +7,7 @@ A [Gufo](https://github.com/gufo-org/gufo) model extension that runs Inkling 2 M
 It provides text generation, tool calls, reasoning control, image input (`--mmproj`), prefix caching
 with RAM and disk checkpoints, and several concurrent sessions, all through `gufo serve`.
 
-Status: version 0.1.2, development builds only. It was developed and measured on one machine class,
+Status: version 0.1.3, development builds only. It was developed and measured on one machine class,
 a Ryzen AI MAX+ 395 (gfx1151, 128 GiB), against Gufo v0.35.0 (`0260e11`), extension API 0.3.x. Nothing
 here has been tested on other GPUs or other Gufo versions. The dev logs behind every number below are in
 [docs/dev/](docs/dev/) and in the kernel lab notes ([lab/RESULTS.md](lab/RESULTS.md)).
@@ -16,14 +16,23 @@ here has been tested on other GPUs or other Gufo versions. The dev logs behind e
 
 GGUF only, two layouts:
 
-- architecture `inkling2_loop` (24 blocks; mainline llama.cpp layout and the Unsloth `Mainline_Support` files), and
-- architecture `inkling2` (48 layer visits; the Unsloth root files).
+- architecture `inkling2_loop` (24 blocks; the mainline llama.cpp layout), and
+- architecture `inkling2` (48 layer visits; Unsloth's original layout).
+
+Unsloth reorganised [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) on 2026-11-23 (revision `8078d149`):
+
+- The root files are now the mainline layout, the same files as `Mainline_Support/`.
+- The original layout moved to `Old_Support/`.
+
+The extension loads both. In the table, "mainline layout" means the current root files (or `Mainline_Support/`), and "original layout" means the files now in `Old_Support/`.
 
 | File | State |
 | --- | --- |
-| Unsloth `UD-Q4_K_XL` | primary target; all tests and measurements below use it (`Mainline_Support` layout, 16.4 GiB of weights). The root-layout file (architecture `inkling2`) also loads through `gufo serve` and answers correctly (46.7 tok/s decode, single request) |
+| Unsloth `UD-Q4_K_XL` | primary target; all tests and measurements below use it (mainline layout, 16.4 GiB of weights). The original-layout file (architecture `inkling2`) also loads through `gufo serve` and answers correctly (46.7 tok/s decode, single request) |
 | Unsloth `UD-IQ4_XS` | works through `gufo serve` (42.9 tok/s decode, correct answer); KL measured (uses slower fallback kernels for the K and IQ types) |
 | Unsloth `UD-Q8_K_XL` | works in both layouts through `gufo serve` (correct answer, 31.8 tok/s decode, 24.9 GiB of GPU memory); its BF16 loop-controller tensors are widened to F32 at load. Added in the final verification pass: no KL measured through this engine, and it was not part of the earlier test runs |
+| Unsloth DSpark drafter, original | **use this one** with `--dspark-model`: `dspark-Inkling-2-Mini-Q8_0_Old.gguf` at the repository root (402 MB; the same file as `Old_Support/dspark-Inkling-2-Mini-Q8_0.gguf_file`). It works with both model layouts, and the speculative numbers below use it |
+| Unsloth DSpark drafter, 2026-11-23 | **not supported**: `dspark-Inkling-2-Mini-Q8_0.gguf` at the root (504 MB) is a differently built drafter: a two-matrix Markov head, per-block context mixing and 7 mask embeddings. The extension refuses it at load with "hyper-parameters differ". Gufo's built-in Inkling 2 Mini supports it |
 | ggml-org Q8_0 / IQ4_NL / BF16 | work through `gufo serve`, correct answer, single-request decode 35.9 / 35.0 / 20.0 tok/s (BF16: 52 GiB of GPU memory); no KL measured through this engine |
 
 Accepted tensor types (BF16 is accepted for large matrices; the small tensors may be F32 or BF16, and BF16 ones are widened to F32 once at load, `src/weights.cpp`): F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K, Q5_0, IQ4_NL, IQ4_XS and NVFP4
@@ -107,8 +116,24 @@ Notes:
   about 1.5 ms is gaps between kernels; the measured short-context ceiling of this design is about 46 to 47 tok/s (a bench-tool figure at short context; through `gufo serve` a single request measured 46.6 to 46.7 tok/s, at a different context length and with a different client, see the Q4_K_XL rows of final-verify.md section 7). At 32K
   the 8 global attention visits read about 1.07 GB of f16 KV per token; q8 KV (not implemented) would reduce that.
 - UD-IQ4_XS on the extension: 39.3 tok/s decode and 839 tok/s prefill at 4K in `inkling2_bench` (step 6 of the M2 log; the K and IQ types use fallback kernels); 42.9 tok/s through `gufo serve` in the final-verification run (a single non-streaming request, 200 tokens).
-- Speculative decoding (DSpark drafter): not implemented. The manifest declares no speculative mode and no extra option, and
-  the runner refuses a request for speculative decoding at load time.
+- Speculative decoding (0.1.3): two draft sources, both verified by the model, so a single session's text is identical to plain decoding for greedy and for sampled requests (for the same seed); a draft only changes how many tokens one step yields. Two exceptions:
+  - Forcing lookup with `INKLING2_LOOKUP=1` where the fast multi-row verify is unavailable, or with `INKLING2_LOOKUP_PREFILL_VERIFY`, verifies with the prefill kernels. That path is equal up to rounding, not bit for bit.
+  - With lookup on, batched decode splits global attention per session rather than by the batch's longest context. So when the sessions in a batch are at very different context lengths, the text can differ by rounding from 0.1.2's batched path, though it is closer to single-session decode. `INKLING2_LOOKUP=0` restores the 0.1.2 batch numerics. Detail in [docs/dev/v013-lookup.md](docs/dev/v013-lookup.md) and [docs/dev/v013-dspark.md](docs/dev/v013-dspark.md).
+  - Prompt lookup copies a continuation from the request's own prompt and text so far. It is **on by default**; `INKLING2_LOOKUP=0` turns it off (the 0.1.2 behaviour). Where the fast multi-row verify is unavailable (a dev switch such as `INKLING2_NOBATCH`, or `INKLING2_UBATCH` below 272) it turns itself off with a note in the log, unless `INKLING2_LOOKUP=1` forces it. Sampled requests copy only from the prompt and need a 24-token match (greedy: 12).
+  - The DSpark drafter is loaded with `--dspark-model dspark-Inkling-2-Mini-Q8_0_Old.gguf` (the original drafter; see Supported model files; the manifest declares the `dspark` speculative mode). It drafts up to 7 tokens in one extra call per step. In batches it drafts only when its margin pays, and it never takes probe calls there; `INKLING2_DSPARK_OFF=1` keeps it loaded but never drafts.
+  - The draft length is adaptive: a per-request acceptance estimate and a measured cost table decide how many tokens to draft, if any, from which source. In batches of two or more sessions the drafter did not pay in any measurement, so a lane there takes no probe calls; batches run at about plain speed.
+  - Speed, one session, ratio of tokens per second to plain decoding (median of 3 rounds, `inkling2_lookup_test --mode dspeed`, same machine and file; texts identical in every run):
+
+    | Workload | Lookup only | Lookup + drafter (top-k 512 head) |
+    | --- | --- | --- |
+    | chat | x1.00 | x0.96 |
+    | code | x1.03 | x1.15 |
+    | math | x1.00 | x1.35 |
+    | summaries | x1.18 | x1.51 |
+    | copy-heavy | x2.26 | x2.23 |
+    | mixed (text with breaks) | x1.99 | x1.97 |
+
+    Chat is a small loss with the drafter (x0.96 to x0.97 over two runs; the run-to-run spread is about 0.01). Batches of 2 to 4 sessions, measured with the drafter's probe calls on (x0.97 to x0.99 of plain), ran at x0.99 with them off, which is what 0.1.3 does. The rows come from the final 0.1.3 run, and an earlier run agreed within 0.01 ([docs/dev/v013-dspark.md](docs/dev/v013-dspark.md), "Final runs"). The "mixed" row is the mixed-breaks text.
 
 ### Memory and sessions
 
@@ -116,9 +141,16 @@ Per-session state is 32 KiB per token for the 8 global-attention visits, plus 40
 the default 2,048-token micro-batch) and 3.8 MB of short-convolution history. llama.cpp's KV cache is about 130 KB
 per token in the same model ([docs/dev/llama-cpp-baseline.md](docs/dev/llama-cpp-baseline.md), S4).
 
+0.1.3 adds to this. The sizes come from the code's per-session claims (`src/engine.cpp`, `src/dspark.cpp`); they were not measured on a loaded server:
+
+- **Lookup (default):** about 31 MB per session for the 8 short-convolution snapshots that rollback needs.
+- **`--dspark-model`:** about 0.4 GB of drafter weights and 150 MB of feature buffers once. Per session, about 18 MB plus 4 KiB per token of context, claimed for the whole context up front. That is about 0.85 GB a session at 200K, or 3.3 GB for `--sessions 4`.
+
+So a `--sessions`/`--context` pair that fitted on 0.1.2 can be refused at load once the drafter is loaded.
+
 | Config | Extension | llama.cpp HIP |
 | --- | --- | --- |
-| 2 sessions, 32K context | about 21 GiB of GPU memory after load in a `gufo serve` smoke of the `Mainline_Support` file (`--context 32768 --sessions 2`; with `--sessions 1` the root-layout file used 20.0 GiB), [docs/dev/final-verify.md](docs/dev/final-verify.md) section 7. Weights are 16.4 GiB | 21.6 GiB GPU memory (1 session, `-c 32768`) |
+| 2 sessions, 32K context | about 21 GiB of GPU memory after load in a `gufo serve` smoke of the `Mainline_Support` file (`--context 32768 --sessions 2`; with `--sessions 1` the original-layout file used 20.0 GiB), [docs/dev/final-verify.md](docs/dev/final-verify.md) section 7. Weights are 16.4 GiB | 21.6 GiB GPU memory (1 session, `-c 32768`) |
 | 1 session, 262,144 context | not measured | 49.3 GiB |
 | 4 sessions x 200K context | loads in 3 to 6 s, 44.9 GiB (46,001 MiB) of GPU memory used; 4 concurrent requests ran fine | 60.6 GiB (`-c 800768 -np 4`) |
 | 1 session, 1,000,000 context (`--context 1000000`) | loads in 4 s; 49.5 GiB (50,701 MiB) of GPU memory used after load and also at the peak while prefilling long prompts. A 268,259-token prompt (a number hidden in the middle of WikiText-2 paragraphs, reasoning off) was answered correctly after 352 s (762 tok/s prefill), and an 893,363-token prompt of the same kind after 2,409 s (371 tok/s); decode after load is 46 tok/s | 1,048,576 context (`-c 1048576`): fails to load, one 101,564 MiB KV allocation runs out of memory |
@@ -153,7 +185,7 @@ gufo extension install https://github.com/headbouyJB/inkling2-gufo@<commit> --ye
 gufo extension list
 ```
 
-`gufo extension list` should then show a line like `inkling2 0.1.2 [installed, ready]`. `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag).
+`gufo extension list` should then show a line like `inkling2 0.1.3 [installed, ready]`. `<commit>` is the release commit (the full hash is safest; Gufo accepts any commit or tag).
 
 `--yes` skips Gufo's confirmation prompt for unreviewed sources; read the source first (it is native code that runs with your permissions).
 
@@ -230,6 +262,26 @@ The engine switches are read when the engine is created (model load), not per re
 | `INKLING2_PROFILE_PREFILL` | engine | per-section GPU time of each prefill micro-batch, printed to stderr (a running average, one line per micro-batch; synchronises the stream) | off | debug |
 | `INKLING2_DBG_DBL` | engine | runs the fast projection GEMV a second time on the same input in each layer (a debug check on that kernel; slows decode) | off | debug |
 | `INKLING2_DBG_TAP` | engine | prints `TAP ...` lines (layer-output checksum per visit and token) to stderr; only active together with `INKLING2_NOGRAPH`. Does not write files | off | debug |
+| `INKLING2_LOOKUP` | runner (`src/runner.cpp`) | prompt lookup: `0` (or `off`, `false`) is off; `1` (or `on`, `true`) forces it on even where the multi-row verify is unavailable (it then uses the slower prefill verify, or refuses a too-small `INKLING2_UBATCH`); unset is on where the fast verify is available. Any other value refuses the load | on | feature |
+| `INKLING2_LOOKUP_FIXED` | runner | `1`..`7`: every step drafts min(copy length, k) tokens; `0` or unset: adaptive. A bad value fails the load | adaptive | A/B |
+| `INKLING2_LOOKUP_LIMIT` | runner | width limit after a rejected copy: `classic`, `floor3` or `none` | none | A/B |
+| `INKLING2_LOOKUP_COSTS` | runner | file replacing the built-in verify-cost table of the lookup policy | built-in table | tuning |
+| `INKLING2_LOOKUP_LOG` | runner | one stderr line per lookup round (non-empty, not `0`) | off | debug |
+| `INKLING2_LOOKUP_PREFILL_VERIFY` | runner | verify drafts with the prefill kernels (the first lookup implementation, kept for A/B runs) instead of the decode rows. It takes effect only with `INKLING2_LOOKUP=1`; on its own it turns the default lookup off | off | A/B |
+| `INKLING2_DSPARK_OFF` | runner | the drafter stays loaded and its feature taps run, but it never drafts (measures the tap cost) | off | A/B |
+| `INKLING2_DSPARK_FIXED` | runner | `1`..`7`: eligible lanes without a copy draft that many tokens; unset or `0`: adaptive | adaptive | A/B |
+| `INKLING2_DSPARK_MINCTX` | runner | committed positions the drafter must hold before it drafts (`1`..`4096`); after a cache restore it starts without context | 32 | tuning |
+| `INKLING2_DSPARK_COSTS` | runner | file replacing the built-in drafter cost table | built-in table | tuning |
+| `INKLING2_DSPARK_MARGIN` | runner | in a batch of 2 or more lanes a drafter allocation must beat the best one without it by this fraction; `0` disables | 0.05 | A/B |
+| `INKLING2_DSPARK_DEFF` | runner | `0`/`1`: use the in-batch drafter cost D_eff of the cost table in a batch | 1 | A/B |
+| `INKLING2_DSPARK_LCB` | runner | what the policy decides on: `0` the acceptance mean, `1` the lower confidence bound at every position, `2` the bound at position 1 only | 2 | A/B |
+| `INKLING2_DSPARK_PRIOR_WEIGHT` | runner | weight of the acceptance prior | 1.5 | A/B |
+| `INKLING2_DSPARK_PROBE` | runner | `0`/`1`: cost-budgeted probe calls after the drafter was declined. Single sessions only; lanes in a batch never probe | 1 | A/B |
+| `INKLING2_DSPARK_PROBE_BUDGET` | runner | probe budget as a fraction of the step time (`0`..`0.5`) | 0.02 | A/B |
+| `INKLING2_DSPARK_LOG` | runner | one stderr line per drafter round (non-empty, not `0`) | off | debug |
+| `INKLING2_DSPARK_TOPK` | engine | head of the drafter: `0` exact, `1`..`1024` restricted to the top k | 512 | tuning |
+| `INKLING2_DSPARK_TAP_SHIFT` | engine | `-1`, `0` or `1`: moves the layer-visit taps of the drafter features (`1` takes the outputs) | 0 | debug |
+| `INKLING2_DSPARK_WINDOW` | drafter (`src/dspark.cpp`) | shifts the sliding-window edge of the drafter attention by N positions (`-64`..`31`) | 0 | debug |
 | `INKLING2_VISION_LOG` | engine (`src/runner.cpp`); also set by `tests/vision/serve-inner.sh` | logs image size, rows and encode time to stderr for every image | off | debug |
 | `INKLING2_VISION_TAP` | vision encoder (`src/vision/vision_encoder.hip`), so the server, and the `vision_test` and `inkling2_image_oracle` test programs | **writes files**: dumps the activations after each encoder stage as `<stage>.bin` (float32, 16-byte header of four ints, then rows x cols) into this directory. The directory must already exist; files are overwritten, and the dump synchronises the stream after every stage. A debug aid for comparing against the llama.cpp-side oracle | off | debug only |
 | `INKLING2_TEST_GGUF` | `inkling2_text_tests` (`tests/text/text_tests.cpp`) | path of an Inkling 2 GGUF to read the tokenizer from; tests are skipped if it cannot be loaded | `Inkling-2-Mini-UD-Q4_K_XL.gguf_file` in the working directory | tests |
@@ -306,6 +358,17 @@ Other limits:
 - Quality was measured as KL on 9,300 WikiText tokens and by suite results; there is no perplexity run through this engine and no
   benchmark of generated-text quality.
 - Only Gufo v0.35.0 was built with this extension. Gufo main (API 0.3.35) was read, not built.
+
+## Changes in 0.1.3
+
+- Prompt lookup for greedy and sampled requests, on by default (`INKLING2_LOOKUP=0` turns it off), verified through the decode kernels in one multi-row launch, with an adaptive draft length ([docs/dev/v013-lookup.md](docs/dev/v013-lookup.md)).
+- DSpark drafter (`--dspark-model`) run inside the engine, with a per-request adaptive policy that chooses between the copy, the drafter and no draft ([docs/dev/v013-dspark.md](docs/dev/v013-dspark.md)).
+- A single session's output is the text of plain decoding (greedy and sampled for the same seed); a draft only changes the speed. Batches and the forced prefill verify differ only by rounding (see Performance).
+- `INKLING2_LOOKUP` accepts only `0`/`1`/`off`/`on`/`false`/`true`; any other value refuses the load.
+- Batches of 2 or more sessions take no drafter probes and earn no probe credit (batches x0.972-0.988 of plain with them, x0.992-0.995 without).
+- Environment switches `INKLING2_LOOKUP*` and `INKLING2_DSPARK*` (table above).
+- Unsloth's 2026-11-23 drafter is not supported; use `dspark-Inkling-2-Mini-Q8_0_Old.gguf` (see Supported model files).
+- Manifest version 0.1.3; the manifest now declares the `dspark` speculative mode and the `--dspark-model` option.
 
 ## Changes in 0.1.2
 

@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "inkling2",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "api_version": ">= 0.3.20",
   "entry": "inkling2_register",
   "registration_target": "gufo_inkling2",
@@ -21,7 +21,64 @@
         "inkling-2-mini"
       ],
       "target": "gufo_inkling2_hip",
-      "entry": "inkling2_provider_register"
+      "entry": "inkling2_provider_register",
+      "speculative": [
+        "dspark"
+      ],
+      "serving": {
+        "draft_options": {
+          "dspark": "--dspark-model"
+        }
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "inkling-2-mini",
+      "provider": "inkling2",
+      "license": "apache-2.0",
+      "description": "Inkling 2 Mini, UD-Q4_K_XL GGUF (original layout: the root file at the pinned revision), with the optional DSpark drafter",
+      "components": [
+        {
+          "role": "weights",
+          "option": "--model",
+          "install": "required",
+          "source": {
+            "hf": "unsloth/Inkling-2-Mini-GGUF",
+            "revision": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f"
+          },
+          "include": [
+            "Inkling-2-Mini-UD-Q4_K_XL.gguf"
+          ]
+        },
+        {
+          "role": "dspark",
+          "option": "--dspark-model",
+          "install": "optional",
+          "source": {
+            "hf": "unsloth/Inkling-2-Mini-GGUF",
+            "revision": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f"
+          },
+          "include": [
+            "dspark-Inkling-2-Mini-Q8_0.gguf"
+          ]
+        }
+      ]
+    }
+  ],
+  "options": [
+    {
+      "name": "--dspark-model",
+      "type": "path",
+      "commands": [
+        "serve",
+        "bench",
+        "prompt"
+      ],
+      "providers": [
+        "inkling2"
+      ],
+      "help": "DSpark draft model path for speculative decoding"
     }
   ],
   "targets": {
@@ -34,6 +91,12 @@
       ]
     },
     "inkling2_probe_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "inkling2_policy_test": {
       "requires": [
         "testing"
       ],
@@ -67,6 +130,20 @@
       "role": "test"
     },
     "inkling2_cache_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "inkling2_lookup_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
+    },
+    "inkling2_dspark_test": {
       "requires": [
         "hip",
         "testing"

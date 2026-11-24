@@ -14,6 +14,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "src/dspark.hpp"
+#include "src/hip/dspark.hpp"
 #include "src/hip/fast.hpp"
 #include "src/hip/kernels.hpp"
 
@@ -22,6 +24,7 @@ namespace {
 
 namespace kk = hip;
 namespace fs = fast;
+namespace dsh = dspark_hip;
 
 constexpr int kEmbd = 2304;
 constexpr int kQ = 3072;   // 24 heads x 128
@@ -30,6 +33,7 @@ constexpr int kRel = 384;  // 24 heads x 16
 constexpr int kConvChannels = 1024 + 1024 + 2304 + 2304;
 constexpr int kConvOffK = 0, kConvOffV = 1024, kConvOffAttn = 2048, kConvOffFfn = 2048 + 2304;
 constexpr int kLogitChunk = 64;
+constexpr int kDefaultDSparkTopK = 512;  // head mode of the drafter unless INKLING2_DSPARK_TOPK says otherwise (0 = exact)
 
 }  // namespace
 
@@ -270,13 +274,159 @@ struct Engine::Impl {
     Check(hipMemcpy(d, h.data(), n * 2, hipMemcpyHostToDevice), "f16 weights");
     half_of[t.data] = d;
   }
+  // ---- 0.1.3 DSpark drafter (Engine::LoadDSpark). Everything below is inert while `dsp` is null. ----
+  std::unique_ptr<dspark::Drafter> dsp;
+  bool dsp_on = false;                // taps are part of the decode graphs and of the prefill ubatch
+  int tap_visit[3] = {5, 23, 41};     // inputs of these visits (INKLING2_DSPARK_TAP_SHIFT=1 takes the outputs instead: visits + 1)
+  float* p_tap = nullptr;             // prefill: [U][4 x 2304] features of the running ubatch
+  float* p_tap_spill = nullptr;       // the same, spilled around a layered-prefill yield (both allocated by EnableDSpark and counted by dspark_bytes())
+  std::size_t tap_bytes = 0;
+  int dsp_fault = 0;                  // test hook: sites that throw (Engine::SetDSparkFaultForTest)
+  Engine::FeatureSink fsink;
+  [[nodiscard]] int TapCol(int visit) const {
+    for (int c = 0; c < 3; ++c)
+      if (tap_visit[c] == visit) return c;
+    return -1;
+  }
+  void DspFault(int site) const {
+    if ((dsp_fault & site) != 0) throw std::runtime_error("inkling2 dspark: injected fault");
+  }
+  /// The drafter of this session failed on its own side (never the target's): off for the rest of the session. A new segment starts at the session
+  /// position so that nothing stale is ever drafted from. Called from noexcept wrappers only.
+  void DspBreak(Session& ss, const char* where, const char* what) noexcept {
+    (void)hipGetLastError();
+    if (!ss.dsp_broken_)
+      std::fprintf(stderr, "inkling2: warning: the DSpark drafter failed in %s (%s); it is off for this session, the request is unaffected\n", where, what);
+    ss.dsp_broken_ = true;
+    if (ss.dsp_ != nullptr) dspark::Drafter::NewSegment(*ss.dsp_, ss.pos_);
+  }
+  /// The session's drafter state (created here for a session that was made before the drafter was loaded; Engine::NewSession makes it otherwise);
+  /// null when this session's drafter is broken, or its allocation fails (it then breaks). Never throws.
+  dspark::SessionState* DspState(Session& ss) noexcept {
+    if (ss.dsp_broken_) return nullptr;
+    if (ss.dsp_ == nullptr) {
+      try {
+        DspFault(8);
+        ss.dsp_ = dsp->NewSession(eng->max_context_).release();
+      } catch (const std::exception& e) {
+        DspBreak(ss, "its state allocation", e.what());
+        return nullptr;
+      }
+    }
+    return ss.dsp_;
+  }
+  /// The tap destination of the row at `pos` of this session: its ring slot, or null (the sink) when the session's drafter is off.
+  const float* DspSlot(Session& ss, std::size_t pos) noexcept {
+    auto* st = DspState(ss);
+    return st != nullptr ? dspark::Drafter::RingSlot(*st, pos) : nullptr;
+  }
+  /// Copies `count` positions of the session's ring to the feature sink (debug).
+  void SinkRing(dspark::SessionState& st, std::size_t first, std::size_t count) {
+    if (!fsink || count == 0) return;
+    std::vector<float> host(count * dspark::kFeat);
+    for (std::size_t i = 0; i < count; ++i)
+      Check(hipMemcpy(host.data() + i * dspark::kFeat, dspark::Drafter::RingSlot(st, first + i), dspark::kFeat * 4, hipMemcpyDeviceToHost), "feature sink");
+    fsink(first, count, host.data());
+  }
+  /// After a decode launch: the captured rows of `count` committed positions starting at `first`. noexcept (M1): the target's state has been
+  /// advanced by the caller BEFORE this runs, and a failure here (the drafter's own allocation or launches) only turns the drafter off.
+  void DspCaptured(Session& ss, std::size_t first, std::size_t count, int fault_site = 1) noexcept {
+    if (ss.dsp_broken_) return;
+    try {
+      DspFault(fault_site);
+      dspark::SessionState* st = DspState(ss);
+      if (st == nullptr) return;
+      dsp->Captured(*st, first, count, ds);
+      SinkRing(*st, first, count);
+    } catch (const std::exception& e) {
+      DspBreak(ss, "the capture", e.what());
+    }
+  }
+  /// Before a decode launch: the device table of per-row destinations (the ring slot of every row's position; the sink for a session whose
+  /// drafter is off).
+  void DspRowDst(const float* const* dst, int rows) { dsp->SetTapDst(dst, rows, ds); }
+  /// After a prefill ubatch: injects the T positions starting at pos0 whose features are in p_tap. noexcept like DspCaptured (the ubatch has advanced
+  /// pos_ already).
+  void DspInjectPrefill(Session& ss, int first, int count) noexcept {
+    if (ss.dsp_broken_) return;
+    try {
+      DspFault(2);
+      dspark::SessionState* st = DspState(ss);
+      if (st == nullptr) return;
+      if (st->cap_hi != static_cast<std::size_t>(first)) dspark::Drafter::NewSegment(*st, first);
+      else if (st->cap_hi > st->ctx_hi) dsp->InjectPending(*st, s);  // positions captured by decode steps come first
+      dsp->Inject(*st, p_tap, dspark::kFeat, count, static_cast<std::size_t>(first), s);
+      if (fsink) {
+        std::vector<float> host(static_cast<std::size_t>(count) * dspark::kFeat);
+        Check(hipMemcpy(host.data(), p_tap, host.size() * 4, hipMemcpyDeviceToHost), "feature sink");
+        fsink(static_cast<std::size_t>(first), static_cast<std::size_t>(count), host.data());
+      }
+    } catch (const std::exception& e) {
+      DspBreak(ss, "the prefill injection", e.what());
+    }
+  }
+  void EnableDSpark(std::unique_ptr<dspark::Drafter> d) {
+    // S2: everything that can fail is done before the engine changes (dsp_on, the decode graphs): the tap shift is parsed and the two
+    // prefill feature buffers (p_tap, and p_tap_spill for a layered-prefill yield) are allocated first. Only then the graphs are dropped and
+    // captured again with the taps in them; a failure there puts everything back.
+    int visit[3] = {tap_visit[0], tap_visit[1], tap_visit[2]};
+    if (const char* t = std::getenv("INKLING2_DSPARK_TAP_SHIFT")) {
+      const int sh = std::atoi(t);
+      if (sh < -1 || sh > 1) throw std::runtime_error("inkling2: INKLING2_DSPARK_TAP_SHIFT must be -1, 0 or 1");
+      for (int& v : visit) v += sh;
+    }
+    float* tap = NewBuf(static_cast<std::size_t>(U) * dspark::kFeat);
+    float* spill = NewBuf(static_cast<std::size_t>(U) * dspark::kFeat);
+    Check(hipDeviceSynchronize(), "dspark sync");
+    const int old_visit[3] = {tap_visit[0], tap_visit[1], tap_visit[2]};
+    for (auto& g : graphs) (void)hipGraphExecDestroy(g.second);
+    graphs.clear();
+    failed_graphs.clear();
+    dsp = std::move(d);
+    for (int i = 0; i < 3; ++i) tap_visit[i] = visit[i];
+    p_tap = tap;
+    p_tap_spill = spill;
+    tap_bytes = 2 * static_cast<std::size_t>(U) * dspark::kFeat * 4;
+    dsp_on = true;
+    try {
+      CaptureShortGraphs();
+    } catch (...) {
+      dsp_on = false;
+      for (auto& g : graphs) (void)hipGraphExecDestroy(g.second);
+      graphs.clear();
+      failed_graphs.clear();
+      for (int i = 0; i < 3; ++i) tap_visit[i] = old_visit[i];
+      p_tap = p_tap_spill = nullptr;
+      tap_bytes = 0;
+      dsp.reset();
+      throw;
+    }
+  }
+  /// The decode graphs of the short context bucket (single-threaded, before any cache thread exists).
+  void CaptureShortGraphs() {
+    if (use_graph && fast_decode && BatchCapable()) {
+      for (nb = 1; nb <= kMaxB; ++nb) (void)CaptureGraph(2048, GraphKey(2048, nb, false));
+      if (eng->lookup_) {
+        mr = true;  // multi-row launches have at least two rows
+        for (nb = 2; nb <= kMaxRows; ++nb) (void)CaptureGraph(2048, GraphKey(2048, nb, true));
+        mr = false;
+      }
+      nb = 1;
+    }
+  }
   bool no_batch = false;  // INKLING2_NOBATCH=1: DecodeBatch runs the sessions one after another
+  // INKLING2_TUNE with a non-zero projection variant: those instantiations only exist for 1..4 tokens, so a launch of
+  // 5..8 rows would throw. Such an engine is not rows_capable() (Engine::rows_capable).
+  bool tune_blocks_rows = false;
   std::map<int, hipGraphExec_t> graphs;
   std::set<int> failed_graphs;  // keys whose capture failed: those steps run eagerly, no retry
   float *d_cur, *d_prelude, *d_bankout, *d_msgs, *d_mixed, *d_ctl, *d_in, *d_g64, *d_proj, *d_sink,
       *d_dyn, *d_ob, *d_ao, *d_h, *d_mixf, *d_hn, *d_moe, *d_rlog, *d_wts8, *d_act8, *d_ws_o, *d_ws_m,
       *d_ws_l;
-  static constexpr int kMaxB = 4;  // sessions per decode batch
+  static constexpr int kMaxB = 4;     // sessions per classic decode batch
+  static constexpr int kMaxRows = 8;  // rows of one multi-row launch (0.1.3 Stage 2; engine created with lookup)
+  bool mr = false;                    // the decode step being built is a multi-row launch (see DecodeRows)
+  fs::RowInfo* d_rowinfo = nullptr;   // [kMaxRows] per-row data of a multi-row launch
   // token strides (floats) of the decode buffers
   static constexpr int kSIn = 3 * kEmbd;    // d_in, d_mixed
   static constexpr int kSCtl = 4 * kEmbd;   // d_ctl, d_msgs
@@ -321,6 +471,9 @@ struct Engine::Impl {
     Check(hipMemcpyAsync(spill_tau, tau, static_cast<std::size_t>(T) * 4, hipMemcpyDeviceToDevice,
                          s),
           "spill");
+    if (dsp_on) {  // the taps captured so far in this ubatch
+      Check(hipMemcpyAsync(p_tap_spill, p_tap, static_cast<std::size_t>(T) * dspark::kFeat * 4, hipMemcpyDeviceToDevice, s), "spill taps");
+    }
   }
   void Unspill() {
     float* live[13];
@@ -331,6 +484,8 @@ struct Engine::Impl {
     Check(hipMemcpyAsync(tau, spill_tau, static_cast<std::size_t>(T) * 4, hipMemcpyDeviceToDevice,
                          s),
           "unspill");
+    if (dsp_on)
+      Check(hipMemcpyAsync(p_tap, p_tap_spill, static_cast<std::size_t>(T) * dspark::kFeat * 4, hipMemcpyDeviceToDevice, s), "unspill taps");
   }
   /// Called after every visit unit; yields at the group boundaries. `mid`: transient activations
   /// are live (inside a ubatch), so they are spilled around the yield.
@@ -509,7 +664,10 @@ struct Engine::Impl {
     if (std::getenv("INKLING2_ACT_FAST")) fs::SetActResidual(false);
     if (const char* t = std::getenv("INKLING2_TUNE")) {
       int a = 0, b = 0, c = 0;
-      if (std::sscanf(t, "%d,%d,%d", &a, &b, &c) >= 1) fs::SetTune(a, b, c);
+      if (std::sscanf(t, "%d,%d,%d", &a, &b, &c) >= 1) {
+        fs::SetTune(a, b, c);
+        tune_blocks_rows = a != 0;
+      }
     }
     profp = std::getenv("INKLING2_PROFILE_PREFILL") != nullptr;
     prof = std::getenv("INKLING2_PROFILE") != nullptr && !use_graph;
@@ -518,7 +676,9 @@ struct Engine::Impl {
     Check(hipStreamCreateWithFlags(&ds2, hipStreamNonBlocking), "decode side stream");
     for (auto& e : fork_ev) Check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "fork event");
     // Decode buffers are kMaxB tokens wide ([token][...]); a step of nb tokens uses the first nb rows.
-    constexpr std::size_t B = kMaxB;
+    // 0.1.3: an engine with lookup on also runs multi-row launches (up to kMaxRows rows); otherwise the buffers
+    // stay as they were (kMaxB rows).
+    const std::size_t B = eng->lookup_ ? kMaxRows : kMaxB;
     d_cur = NewBuf(B * kEmbd);
     d_prelude = NewBuf(B * kEmbd);
     d_bankout = NewBuf(B * kEmbd);
@@ -546,7 +706,9 @@ struct Engine::Impl {
     d_pf_sink = NewBuf(4);
     d_moe_part = NewBuf(B * 8 * kEmbd);
     d_ids8 = NewInts(B * 8);
-    d_step = NewInts(2 * B);  // tokens [B], positions [B]
+    d_step = NewInts(2 * kMaxRows);  // tokens [kMaxRows], positions [kMaxRows]
+    d_rowinfo = static_cast<fs::RowInfo*>(AllocDevice(kMaxRows * sizeof(fs::RowInfo), "row info"));
+    scratch_allocs.push_back(d_rowinfo);
     d_counter = reinterpret_cast<unsigned*>(NewInts(B));
     Check(hipMemset(d_counter, 0, B * 4), "counter");
     d_tbl = static_cast<fs::SlotEntry*>(AllocDevice(B * 48 * sizeof(fs::SlotEntry), "slot table"));
@@ -603,10 +765,7 @@ struct Engine::Impl {
     }
     head_fast = IsType(w->output, kk::kTQ8_0);
     // Capture the short-context graphs now (single-threaded, before any cache thread exists).
-    if (use_graph && fast_decode && BatchCapable()) {
-      for (nb = 1; nb <= kMaxB; ++nb) (void)CaptureGraph(2048, 2048 * 8 + nb);
-      nb = 1;
-    }
+    CaptureShortGraphs();
   }
 
   // ---- helpers ----
@@ -1011,7 +1170,14 @@ struct Engine::Impl {
     const bool swa = !L.is_global;
     float* cur = d_cur;
     const fs::SlotEntry* slot = d_tbl + slot_idx;
-    const int* pos = d_step + kMaxB;
+    const int* pos = d_step + kMaxRows;
+    if (dsp_on) {  // DSpark tap: the input of this visit (the pending post-conv/residual of the previous op is applied first)
+      const int c = TapCol(visit_no);
+      if (c >= 0) {
+        FlushPending();
+        dsh::TapRowsDev(ds, cur, kEmbd, dsp->tap_dst(), c * kEmbd, nb, kEmbd);
+      }
+    }
 
     // A. attention inputs
     const float* inp[3] = {cur, cur, cur};
@@ -1172,6 +1338,10 @@ struct Engine::Impl {
       ka.eps = cfg->rms_eps;
       ka.ld = kSProj;
       ka.ldd = 64;
+      if (mr) {
+        ka.rows = d_rowinfo;
+        ka.visit = slot_idx;
+      }
       fs::KvPrep(ds, ka, nb);
     }
 
@@ -1197,10 +1367,7 @@ struct Engine::Impl {
         aa.chunk = 128;
         aa.nsplit = 8;
       } else {
-        int chunk = std::clamp(bucket_ctx / 32, 128, 2048);
-        chunk = std::max(chunk, (bucket_ctx / 256 + 63) / 64 * 64);
-        aa.chunk = chunk;
-        aa.nsplit = (bucket_ctx + chunk - 1) / chunk;
+        SplitFor(bucket_ctx, &aa.chunk, &aa.nsplit);
       }
       aa.qk_thr = cfg->qk_clip;
       aa.r_thr = cfg->rel_clip;
@@ -1208,6 +1375,7 @@ struct Engine::Impl {
       aa.tau_alpha = cfg->log_scale_alpha;
       aa.ldp = kSProj;
       aa.ws_tok = static_cast<int>(kMaxSplit * 8 * 12);
+      if (mr && !swa) aa.rows = d_rowinfo;  // every row splits by the bucket of its own position (bit-identical to a lone decode)
       fs::AttnDecode(ds, aa, nb);
     }
     Mark("attn");
@@ -1224,6 +1392,10 @@ struct Engine::Impl {
       ca.scale = 1.0f / std::sqrt(5.0f);
       ca.cur = cur;
       ca.blk = nullptr;
+      if (mr) {
+        ca.rows = d_rowinfo;
+        ca.visit = slot_idx;
+      }
       if (ip % static_cast<int>(cfg->attn_res_block) == 0) {
         ca.blk = NewBlock();
         d_states[d_ns++] = ca.blk;
@@ -1304,6 +1476,10 @@ struct Engine::Impl {
       ca.scale = 1.0f / std::sqrt(5.0f);
       ca.cur = cur;
       ca.blk = nullptr;
+      if (mr) {
+        ca.rows = d_rowinfo;
+        ca.visit = slot_idx;
+      }
       pend.on = true;
       pend.a = ca;
     }
@@ -1329,8 +1505,8 @@ struct Engine::Impl {
     if (dbg_tap && !use_graph) {
       FlushPending();
       Check(hipStreamSynchronize(ds), "dbg sync");
-      float h[4 * kEmbd];
-      Check(hipMemcpy(h, d_cur, nb * kEmbd * 4, hipMemcpyDeviceToHost), "dbg copy");
+      std::vector<float> h(static_cast<std::size_t>(kMaxRows) * kEmbd);  // nb <= kMaxRows
+      Check(hipMemcpy(h.data(), d_cur, static_cast<std::size_t>(nb) * kEmbd * 4, hipMemcpyDeviceToHost), "dbg copy");
       for (int b = 0; b < nb; ++b) {
         double sum = 0;
         for (int i = 0; i < kEmbd; ++i) sum += std::abs(h[b * kEmbd + i]);
@@ -1395,6 +1571,7 @@ struct Engine::Impl {
       DLayer(ip, ip, nullptr, bucket_ctx);
     DMix(cur, DS(w->output_res_query), 1, d_mixf);
     kk::RmsNorm(ds, d_mixf, kEmbd, DS(w->output_norm), d_hn, kEmbd, kEmbd, nb, cfg->rms_eps);
+    if (dsp_on) dsh::TapRowsDev(ds, d_hn, kEmbd, dsp->tap_dst(), 3 * kEmbd, nb, kEmbd);  // DSpark tap 4: the final normed hidden state
     const int V = static_cast<int>(cfg->n_vocab_text);
     if (head_fast) {
       fs::GemvQ8(ds, kEmbd, D(w->output), d_hn, logits_d, V, cfg->logit_softcap, nb);
@@ -1403,6 +1580,14 @@ struct Engine::Impl {
       kk::Softcap(ds, logits_d, V, cfg->logit_softcap);
     }
     Mark("head");
+  }
+
+  /// Split size and count of the global-attention decode for a context bucket.
+  static void SplitFor(int bucket_ctx, int* chunk_out, int* nsplit_out) {
+    int chunk = std::clamp(bucket_ctx / 32, 128, 2048);
+    chunk = std::max(chunk, (bucket_ctx / 256 + 63) / 64 * 64);
+    *chunk_out = chunk;
+    *nsplit_out = (bucket_ctx + chunk - 1) / chunk;
   }
 
   static int BucketCtx(int pos) {
@@ -1414,6 +1599,9 @@ struct Engine::Impl {
   /// Captures the decode step of the current `nb` and `ctx` into a graph. Returns graphs.end() when the capture
   /// was invalidated: the cache adapter issues hipMemcpy on the legacy stream from other threads without the
   /// engine mutex, and the runtime can refuse such a copy while a capture is open even in thread-local mode.
+  /// Graph key: context bucket, token (row) count, classic or multi-row launch.
+  static int GraphKey(int ctx, int n, bool multi) { return ctx * 32 + n * 2 + (multi ? 1 : 0); }
+  static int KeyWidth(int key) { return (key % 32) / 2; }
   std::map<int, hipGraphExec_t>::iterator CaptureGraph(int ctx, int key) {
     // Exclusive: no cache or vision thread may issue a device call while the capture is open.
     const std::unique_lock<std::shared_mutex> gate(CaptureGate());
@@ -1421,7 +1609,7 @@ struct Engine::Impl {
       (void)hipGetLastError();
       if (failed_graphs.insert(key).second)
         std::fprintf(stderr, "inkling2: decode graph capture could not start for context bucket %d, width %d; those steps run without a graph\n",
-                     ctx, key % 8);
+                     ctx, KeyWidth(key));
       return graphs.end();
     }
     bool ok = true;
@@ -1439,7 +1627,7 @@ struct Engine::Impl {
     if (!ok) {
       if (failed_graphs.insert(key).second)
         std::fprintf(stderr, "inkling2: decode graph capture failed for context bucket %d, width %d; those steps run without a graph\n",
-                     ctx, key % 8);
+                     ctx, KeyWidth(key));
       return graphs.end();
     }
     return graphs.emplace(key, ex).first;
@@ -1464,22 +1652,28 @@ struct Engine::Impl {
   void DecodeN(Session* const* sess, const std::int32_t* tokens, std::vector<float>* const* outs, int n) {
     nb = n;
     int maxpos = 0;
-    std::int32_t step[2 * kMaxB] = {};
+    std::int32_t step[2 * kMaxRows] = {};
+    mr = false;
     for (int b = 0; b < n; ++b) {
       const int pos = static_cast<int>(sess[b]->pos_);
       maxpos = std::max(maxpos, pos);
       step[b] = tokens[b];
-      step[kMaxB + b] = pos;
+      step[kMaxRows + b] = pos;
     }
     const int ctx = BucketCtx(maxpos);
     // M2: the cache adapter writes state on the default stream; `ds` is non-blocking, so order it.
     Check(hipStreamSynchronize(s), "pre-decode sync");
+    if (dsp_on) {
+      const float* dst[8] = {};
+      for (int b = 0; b < n; ++b) dst[b] = DspSlot(*sess[b], sess[b]->pos_);
+      DspRowDst(dst, n);
+    }
     Check(hipMemcpyAsync(d_step, step, sizeof step, hipMemcpyHostToDevice, ds), "step");
     for (int b = 0; b < n; ++b)
       Check(hipMemcpyAsync(d_tbl + b * 48, sess[b]->tbl_, 48 * sizeof(fs::SlotEntry), hipMemcpyDeviceToDevice, ds),
             "slot table");
     if (use_graph) {
-      const int key = ctx * 8 + n;
+      const int key = GraphKey(ctx, n, false);
       auto it = graphs.find(key);
       if (it == graphs.end() && failed_graphs.count(key) == 0) it = CaptureGraph(ctx, key);
       if (it != graphs.end()) {
@@ -1497,8 +1691,120 @@ struct Engine::Impl {
     }
     Check(hipStreamSynchronize(ds), "decode sync");
     ProfFlush();
-    for (int b = 0; b < n; ++b) sess[b]->pos_ += 1;
+    for (int b = 0; b < n; ++b) {
+      const std::size_t at = sess[b]->pos_;
+      sess[b]->pos_ += 1;  // the target's state first: the drafter's capture cannot leave a session half advanced
+      if (dsp_on) DspCaptured(*sess[b], at, 1);
+    }
     nb = 1;
+  }
+
+  /// One lane of DecodeRowsN: `n` consecutive tokens of one session at its positions pos .. pos + n - 1.
+  struct RowLaneSpec {
+    Session* s;
+    const std::int32_t* tok;
+    int n;
+    float* logits;  // n * V floats; null for a lane of one token (its session's logits())
+  };
+
+  /// A multi-row launch (0.1.3 Stage 2): the rows of all lanes (up to kMaxRows, several per session) run as ONE
+  /// decode step. Every row computes what a single-token decode at its position computes (same kernels, per-row
+  /// accumulators, attention split by the row's own bucket, conv history chained on the earlier rows' raw inputs), so
+  /// its logits are bit-identical to sequential decode. A lane of one row advances its session; a lane of
+  /// several leaves the session where it was (pos_, conv slot) and keeps the state after each row in the
+  /// session's snapshot until CommitRows picks one.
+  void DecodeRowsN(const RowLaneSpec* lanes, int nl) {
+    constexpr std::size_t per = static_cast<std::size_t>(kConvChannels) * 3;
+    int rows = 0;
+    for (int l = 0; l < nl; ++l) rows += lanes[l].n;
+    nb = rows;
+    mr = true;
+    struct Restore {  // also on a failure: the next launch must start from the classic state
+      Impl* i;
+      ~Restore() {
+        i->nb = 1;
+        i->mr = false;
+      }
+    } restore{this};
+    int maxpos = 0;
+    std::int32_t step[2 * kMaxRows] = {};
+    fs::RowInfo ri[kMaxRows] = {};
+    std::vector<fs::SlotEntry> tbl(static_cast<std::size_t>(kMaxRows) * 48);
+    int r = 0;
+    for (int l = 0; l < nl; ++l) {
+      Session& ss = *lanes[l].s;
+      for (int j = 0; j < lanes[l].n; ++j, ++r) {
+        const int pos = static_cast<int>(ss.pos_) + j;
+        maxpos = std::max(maxpos, pos);
+        step[r] = lanes[l].tok[j];
+        step[kMaxRows + r] = pos;
+        ri[r].m = j;
+        SplitFor(BucketCtx(pos), &ri[r].chunk, &ri[r].nsplit);
+        ri[r].snap = lanes[l].n >= 2 ? ss.conv_snap_ + static_cast<std::size_t>(j) * 48 * per : nullptr;
+        for (int i = 0; i < 48; ++i)
+          tbl[static_cast<std::size_t>(r) * 48 + i] = {ss.slots_[i].k, ss.slots_[i].v, ss.slots_[i].conv,
+                                                       static_cast<int>(ss.slots_[i].rows), 0};
+      }
+    }
+    const int ctx = BucketCtx(maxpos);
+    // Before the launch: whatever a lane held (a snapshot, rows awaiting a commit) is stale from here on, also when
+    // the launch throws half way. Set again below once the launch has completed.
+    for (int l = 0; l < nl; ++l) {
+      lanes[l].s->conv_snap_valid_ = false;
+      lanes[l].s->rows_pending_ = 0;
+    }
+    Check(hipStreamSynchronize(s), "pre-decode sync");
+    if (dsp_on) {
+      const float* dst[8] = {};
+      int rr = 0;
+      for (int l = 0; l < nl; ++l)
+        for (int j = 0; j < lanes[l].n; ++j, ++rr) dst[rr] = DspSlot(*lanes[l].s, lanes[l].s->pos_ + j);
+      DspRowDst(dst, rows);
+    }
+    Check(hipMemcpyAsync(d_step, step, sizeof step, hipMemcpyHostToDevice, ds), "step");
+    Check(hipMemcpyAsync(d_rowinfo, ri, sizeof ri, hipMemcpyHostToDevice, ds), "row info");
+    Check(hipMemcpyAsync(d_tbl, tbl.data(), static_cast<std::size_t>(rows) * 48 * sizeof(fs::SlotEntry),
+                         hipMemcpyHostToDevice, ds),
+          "slot table");
+    if (use_graph) {
+      const int key = GraphKey(ctx, rows, true);
+      auto it = graphs.find(key);
+      if (it == graphs.end() && failed_graphs.count(key) == 0) it = CaptureGraph(ctx, key);
+      if (it != graphs.end()) Check(hipGraphLaunch(it->second, ds), "graph launch");
+      else BuildDecode(ctx);
+    } else {
+      BuildDecode(ctx);
+    }
+    const std::size_t V = cfg->n_vocab_text;
+    r = 0;
+    for (int l = 0; l < nl; ++l) {
+      Session& ss = *lanes[l].s;
+      for (int j = 0; j < lanes[l].n; ++j, ++r) {
+        float* dst;
+        if (lanes[l].n == 1) {
+          ss.logits_.resize(V);
+          dst = ss.logits_.data();
+        } else {
+          dst = lanes[l].logits + static_cast<std::size_t>(j) * V;
+        }
+        Check(hipMemcpyAsync(dst, logits_d + static_cast<std::size_t>(r) * V, V * 4, hipMemcpyDeviceToHost, ds),
+              "logits copy");
+      }
+    }
+    Check(hipStreamSynchronize(ds), "decode sync");
+    ProfFlush();
+    for (int l = 0; l < nl; ++l) {
+      Session& ss = *lanes[l].s;
+      if (lanes[l].n == 1) {
+        const std::size_t at = ss.pos_;
+        ss.pos_ += 1;
+        if (dsp_on) DspCaptured(ss, at, 1);
+      } else {
+        // the rows are in the ring (when the session's drafter is on); CommitRows says how many count
+        if (dsp_on && ss.dsp_ != nullptr) ss.dsp_->rows_first = ss.pos_;
+        ss.rows_pending_ = static_cast<std::size_t>(lanes[l].n);
+      }
+    }
   }
 
   void Tap(int visit, const char* what) {
@@ -1531,7 +1837,12 @@ struct Engine::Impl {
     nblocks = 0;
     if (fast_prefill) UploadDenseItems();
     int visit = 0;
+    const auto ptap = [&](int v) {  // DSpark tap: the input of visit v, all T tokens
+      const int c = dsp_on ? TapCol(v) : -1;
+      if (c >= 0) dsh::TapRows(s, cur, kEmbd, p_tap, dspark::kFeat, c * kEmbd, T, kEmbd);
+    };
     for (int ip = 0; ip < static_cast<int>(cfg->core_start); ++ip) {
+      ptap(visit);
       Layer(ss, ip, ip, nullptr);
       Tap(visit++, "l_out");
       MaybeYield(yr, true);  // M2 hook
@@ -1550,6 +1861,7 @@ struct Engine::Impl {
       }
       for (int ip = static_cast<int>(cfg->core_start); ip < static_cast<int>(cfg->core_end);
            ++ip) {
+        ptap(visit);
         if (pass == 0) {
           Layer(ss, ip, ip, nullptr);
         } else {
@@ -1566,17 +1878,29 @@ struct Engine::Impl {
       }
     }
     for (int ip = static_cast<int>(cfg->core_end); ip < static_cast<int>(cfg->n_phys); ++ip) {
+      ptap(visit);
       Layer(ss, ip, ip, nullptr);
       Tap(visit++, "l_out");
       if (visit < 48) MaybeYield(yr, true);  // M2 hook (the last visit is followed by the head)
     }
     ss.pos_ += T;
     PFlush();
+    bool have_hn = false;
+    if (dsp_on) {
+      // DSpark: the final normed hidden state is the 4th tap, wanted for every token of every ubatch (the head is not)
+      kk::Mix(s, States(cur), DF(w->output_res_query), 1, kEmbd, T, mixf, cfg->rms_eps);
+      kk::RmsNorm(s, mixf, kEmbd, DF(w->output_norm), hn, kEmbd, kEmbd, T, cfg->rms_eps);
+      dsh::TapRows(s, hn, kEmbd, p_tap, dspark::kFeat, 3 * kEmbd, T, kEmbd);
+      have_hn = true;
+      DspInjectPrefill(ss, pos0, T);
+    }
     if (!last_ubatch && !sink) return;
 
     // output: attention-residual mix, norm, lm head, soft cap, crop
-    kk::Mix(s, States(cur), DF(w->output_res_query), 1, kEmbd, T, mixf, cfg->rms_eps);
-    kk::RmsNorm(s, mixf, kEmbd, DF(w->output_norm), hn, kEmbd, kEmbd, T, cfg->rms_eps);
+    if (!have_hn) {
+      kk::Mix(s, States(cur), DF(w->output_res_query), 1, kEmbd, T, mixf, cfg->rms_eps);
+      kk::RmsNorm(s, mixf, kEmbd, DF(w->output_norm), hn, kEmbd, kEmbd, T, cfg->rms_eps);
+    }
     const int V = static_cast<int>(cfg->n_vocab_text);
     auto chunk = [&](int a, int n, std::vector<float>* host) {
       G(w->output, hn + static_cast<std::size_t>(a) * kEmbd, kEmbd, logits_d, V, n, V);
@@ -1609,14 +1933,19 @@ Session::~Session() {
     if (sl.conv) (void)hipFree(sl.conv);
   }
   if (tbl_) (void)hipFree(tbl_);
+  if (conv_snap_) (void)hipFree(conv_snap_);
+  delete dsp_;
 }
+
+std::size_t Session::allocated_bytes() const { return bytes_ + (dsp_ != nullptr ? dsp_->Bytes() : 0); }
 
 Engine::~Engine() = default;
 
 std::unique_ptr<Engine> Engine::Create(std::shared_ptr<const core::GgufReader> reader,
-                                       std::uint32_t max_context, std::string* error) {
+                                       std::uint32_t max_context, std::string* error, bool lookup) {
   try {
     auto e = std::unique_ptr<Engine>(new Engine());
+    e->lookup_ = lookup;
     std::string why;
     auto bound = Inkling2Weights::Bind(*reader, &why);
     if (!bound) {
@@ -1653,8 +1982,10 @@ std::unique_ptr<Engine> Engine::Create(std::shared_ptr<const core::GgufReader> r
 std::size_t Engine::session_bytes() const {
   const std::size_t kv_row = 2 * kKV * 2;  // K and V, f16
   const std::size_t ring = 1024 + ubatch_;
-  return 8 * kv_row * max_context_ + 40 * kv_row * ring +
-         48 * static_cast<std::size_t>(kConvChannels) * 3 * 4;
+  const std::size_t conv = 48 * static_cast<std::size_t>(kConvChannels) * 3 * 4;
+  // + the conv snapshots of verify passes: one region per row of a multi-row launch (region 0 also serves SnapshotConv)
+  return 8 * kv_row * max_context_ + 40 * kv_row * ring + conv + (lookup_ ? kMaxRows * conv : 0) +
+         (impl_ && impl_->dsp_on ? dspark::Drafter::SessionBytes(max_context_) : 0);
 }
 
 std::unique_ptr<Session> Engine::NewSession() {
@@ -1672,6 +2003,11 @@ std::unique_ptr<Session> Engine::NewSession() {
     sl.conv = static_cast<float*>(AllocDevice(kConvChannels * 3 * 4, "conv state"));
     s->bytes_ += 2 * bytes + kConvChannels * 3 * 4;
   }
+  if (lookup_) {  // the conv snapshot of verify passes: allocated here so the resource claim counts it
+    const std::size_t snap = kMaxRows * 48 * static_cast<std::size_t>(kConvChannels) * 3 * 4;
+    s->conv_snap_ = static_cast<float*>(AllocDevice(snap, "conv snapshot"));
+    s->bytes_ += snap;
+  }
   {
     fs::SlotEntry host[48];
     for (int i = 0; i < 48; ++i)
@@ -1680,6 +2016,10 @@ std::unique_ptr<Session> Engine::NewSession() {
     Check(hipMemcpy(s->tbl_, host, sizeof host, hipMemcpyHostToDevice), "slot table");
   }
   gate.unlock();
+  // M1: with the drafter on, its per-session state (the fixed parts: ring, window rings, f_rnn and its history, the chunk tables) is allocated HERE,
+  // where a failure is a failed NewSession and nothing else, not lazily in the middle of a decode step. The global layer's chunks grow with the
+  // context (lazily, in the injection, where a failure turns the drafter of that session off).
+  if (impl_->dsp_on) s->dsp_ = impl_->dsp->NewSession(max_context_).release();
   Reset(*s);
   return s;
 }
@@ -1692,6 +2032,10 @@ void Engine::Reset(Session& s) {
   }
   s.pos_ = 0;
   s.logits_.clear();
+  s.conv_snap_valid_ = false;
+  s.rows_pending_ = 0;
+  s.dsp_broken_ = false;  // a new use of the session: the drafter gets another chance
+  if (s.dsp_ != nullptr) dspark::Drafter::NewSegment(*s.dsp_, 0);
 }
 
 bool Engine::batch_capable() const {
@@ -1715,12 +2059,269 @@ void Engine::DecodeBatch(std::span<Session* const> sessions, std::span<const std
     if (s.hooks_ != nullptr) s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);  // M2 hook
   }
   if (sessions.size() >= 2 && batch_capable()) {
+    if (rows_capable()) {
+      // Engine with lookup: a batch takes the per-row path, so that a lane's logits are the same whether or not a
+      // neighbour drafts in the same step (the classic launch splits global attention by the bucket of the batch's
+      // LARGEST position, the per-row launch by each row's own; the runner uses DecodeRows whenever a lane drafts).
+      Impl::RowLaneSpec specs[Impl::kMaxB];
+      for (std::size_t i = 0; i < sessions.size(); ++i) specs[i] = {sessions[i], &tokens[i], 1, nullptr};
+      impl_->DecodeRowsN(specs, static_cast<int>(sessions.size()));
+      return;
+    }
     std::vector<float>* outs[Impl::kMaxB];
     for (std::size_t i = 0; i < sessions.size(); ++i) outs[i] = &sessions[i]->logits_;
     impl_->DecodeN(sessions.data(), tokens.data(), outs, static_cast<int>(sessions.size()));
     return;
   }
   for (std::size_t i = 0; i < sessions.size(); ++i) impl_->Decode(*sessions[i], tokens[i], &sessions[i]->logits_);
+}
+
+bool Engine::rows_capable() const { return lookup_ && batch_capable() && !impl_->tune_blocks_rows; }
+
+void Engine::DecodeRows(std::span<const RowLane> lanes) {
+  static_assert(Engine::kMaxRows == static_cast<std::size_t>(Impl::kMaxRows), "Engine::kMaxRows and Impl::kMaxRows must agree");
+  if (lanes.empty() || lanes.size() > kMaxRows) throw std::runtime_error("inkling2: bad decode rows");
+  if (!rows_capable()) throw std::logic_error("inkling2: multi-row decode needs an engine created with lookup and fast decode kernels");
+  const std::lock_guard lock(mutex_);
+  const std::uint32_t V = weights_.config.n_vocab_text;
+  std::size_t rows = 0;
+  std::vector<Impl::RowLaneSpec> specs;
+  for (std::size_t i = 0; i < lanes.size(); ++i) {
+    const RowLane& l = lanes[i];
+    if (l.session == nullptr || l.tokens.empty() || l.tokens.size() > kMaxRows)
+      throw std::runtime_error("inkling2: bad decode rows");
+    Session& s = *l.session;
+    for (std::size_t j = 0; j < i; ++j)
+      if (lanes[j].session == &s) throw std::runtime_error("inkling2: duplicate session in decode rows");
+    if (s.pos_ + l.tokens.size() > max_context_) throw std::runtime_error("inkling2: context exhausted");
+    if (l.tokens.size() >= 2 && (l.logits == nullptr || s.conv_snap_ == nullptr))
+      throw std::runtime_error("inkling2: a multi-row lane needs a logits buffer and a session with a conv snapshot");
+    for (const auto t : l.tokens)
+      if (t < 0 || static_cast<std::uint32_t>(t) >= V) throw std::runtime_error("inkling2: token id out of range");
+    rows += l.tokens.size();
+    specs.push_back({&s, l.tokens.data(), static_cast<int>(l.tokens.size()), l.logits});
+  }
+  if (rows > kMaxRows) throw std::runtime_error("inkling2: too many rows in one decode launch");
+  for (const auto& l : lanes)
+    if (l.session->hooks_ != nullptr) l.session->hooks_->BeforeWrite(l.session->pos_, l.session->pos_ + l.tokens.size());  // M2 hook
+  bool multi = false;
+  for (const auto& l : lanes) multi = multi || l.tokens.size() >= 2;
+  if (lanes.size() == 1 && !multi) {
+    // one plain lane: the classic single-token launch (its bucket is the row's own, so it is what a row computes);
+    // two or more plain lanes take the per-row launch below, like Engine::DecodeBatch on an engine with lookup
+    Session* sp[Impl::kMaxB];
+    std::int32_t ids[Impl::kMaxB];
+    std::vector<float>* outs[Impl::kMaxB];
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+      sp[i] = lanes[i].session;
+      ids[i] = lanes[i].tokens[0];
+      outs[i] = &sp[i]->logits_;
+    }
+    impl_->DecodeN(sp, ids, outs, static_cast<int>(lanes.size()));
+    return;
+  }
+  impl_->DecodeRowsN(specs.data(), static_cast<int>(specs.size()));
+}
+
+void Engine::CommitRows(Session& s, std::size_t keep, const float* last_row) {
+  const std::lock_guard lock(mutex_);
+  if (s.rows_pending_ == 0 || keep < 1 || keep > s.rows_pending_ || last_row == nullptr)
+    throw std::logic_error("inkling2: CommitRows without a pending multi-row lane or with a bad row count");
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  const std::size_t per = static_cast<std::size_t>(kConvChannels) * 3;
+  const float* from = s.conv_snap_ + (keep - 1) * 48 * per;
+  for (std::size_t i = 0; i < 48; ++i)
+    Check(hipMemcpyAsync(s.slots_[i].conv, from + i * per, per * 4, hipMemcpyDeviceToDevice, impl_->ds), "conv commit");
+  Check(hipStreamSynchronize(impl_->ds), "conv commit sync");
+  const std::size_t V = weights_.config.n_vocab_text;
+  s.logits_.assign(last_row, last_row + V);
+  const std::size_t first = s.pos_;  // the rows were launched at the session position (rows_first)
+  s.pos_ += keep;
+  s.rows_pending_ = 0;
+  s.conv_snap_valid_ = false;
+  // M1: the target's state is complete; the kept rows' features go to the drafter last, and a failure there only turns the drafter off
+  if (impl_->dsp_on) impl_->DspCaptured(s, first, keep, 4);
+}
+
+void Engine::SnapshotConv(Session& s) {
+  const std::lock_guard lock(mutex_);
+  if (s.conv_snap_ == nullptr) throw std::logic_error("inkling2: conv snapshot needs an engine created with lookup");
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  const std::size_t per = static_cast<std::size_t>(kConvChannels) * 3;
+  // On the engine stream, like the Forward passes that read and write the conv history.
+  s.conv_snap_valid_ = false;
+  for (std::size_t i = 0; i < 48; ++i)
+    Check(hipMemcpyAsync(s.conv_snap_ + i * per, s.slots_[i].conv, per * 4, hipMemcpyDeviceToDevice, impl_->s),
+          "conv snapshot");
+  Check(hipStreamSynchronize(impl_->s), "conv snapshot sync");
+  s.conv_snap_valid_ = true;
+}
+
+void Engine::RestoreConv(Session& s) {
+  const std::lock_guard lock(mutex_);
+  if (!s.conv_snap_valid_) throw std::logic_error("inkling2: conv restore without a snapshot");
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  const std::size_t per = static_cast<std::size_t>(kConvChannels) * 3;
+  for (std::size_t i = 0; i < 48; ++i)
+    Check(hipMemcpyAsync(s.slots_[i].conv, s.conv_snap_ + i * per, per * 4, hipMemcpyDeviceToDevice, impl_->s),
+          "conv restore");
+  Check(hipStreamSynchronize(impl_->s), "conv restore sync");
+}
+
+void Engine::Rollback(Session& s, std::size_t pos) {
+  const std::lock_guard lock(mutex_);
+  if (pos > s.pos_) throw std::logic_error("inkling2: rollback beyond the session position");
+  s.pos_ = pos;
+  s.logits_.clear();
+  s.conv_snap_valid_ = false;
+  s.rows_pending_ = 0;
+  // The same session moves back: the drafter's context before `pos` is still the context before `pos` (S3): truncate it instead of starting over
+  // (the Stage 1 verify path rolls back by a few positions; the rejected chain's features beyond `pos` are dropped).
+  if (s.dsp_ != nullptr && impl_->dsp_on) {
+    if (s.dsp_broken_) dspark::Drafter::NewSegment(*s.dsp_, pos);
+    else {
+      try {
+        Check(hipStreamSynchronize(impl_->s), "rewind sync");
+        Check(hipStreamSynchronize(impl_->ds), "rewind sync");
+        (void)impl_->dsp->Rewind(*s.dsp_, pos, impl_->ds);
+      } catch (const std::exception& e) {
+        impl_->DspBreak(s, "the rollback", e.what());
+      }
+    }
+  } else if (s.dsp_ != nullptr) {
+    dspark::Drafter::NewSegment(*s.dsp_, pos);
+  }
+}
+
+bool Engine::LoadDSpark(const std::shared_ptr<const core::GgufReader>& reader, std::string* error) {
+  const std::lock_guard lock(mutex_);
+  try {
+    if (impl_->dsp_on) {
+      if (error) *error = "inkling2: a DSpark drafter is already loaded";
+      return false;
+    }
+    if (!impl_->head_fast) {
+      if (error) *error = "inkling2: the DSpark drafter needs the target's Q8_0 output head";
+      return false;
+    }
+    auto d = std::make_unique<dspark::Drafter>();
+    dspark::Drafter::Target t;
+    t.embd = impl_->D(weights_.token_embd);
+    t.embd_type = static_cast<int>(weights_.token_embd.type);
+    t.embd_norm = impl_->DS(weights_.token_embd_norm);
+    t.head = impl_->D(weights_.output);
+    t.head_type = static_cast<int>(weights_.output.type);
+    t.vocab = static_cast<int>(weights_.config.n_vocab_text);
+    t.eps = weights_.config.rms_eps;
+    t.softcap = weights_.config.logit_softcap;
+    if (!d->Load(*reader, t, impl_->ds, error)) return false;
+    if (const char* k = std::getenv("INKLING2_DSPARK_TOPK")) {
+      char* end = nullptr;
+      const long n = std::strtol(k, &end, 10);
+      if (end == k || *end != '\0' || n < 0 || n > 1024) {
+        if (error) *error = std::string("inkling2: INKLING2_DSPARK_TOPK must be 0 (exact) or 1..1024, not '") + k + "'";
+        return false;
+      }
+      d->set_topk(static_cast<int>(n));
+    } else {
+      d->set_topk(kDefaultDSparkTopK);  // step 3: the restricted head by default (D(k) flat at ~10 ms against 11.5 + 2.3 k; x6 probes: best net speed)
+    }
+    impl_->EnableDSpark(std::move(d));
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+bool Engine::dspark() const { return impl_ && impl_->dsp_on; }
+void Engine::SetDSparkTopK(int n) {
+  const std::lock_guard lock(mutex_);
+  if (!impl_->dsp_on) throw std::logic_error("inkling2: no DSpark drafter loaded");
+  impl_->dsp->set_topk(n);
+}
+int Engine::DSparkTopK() const { return impl_ && impl_->dsp_on ? impl_->dsp->topk() : 0; }
+std::size_t Engine::dspark_bytes() const {
+  return impl_ && impl_->dsp_on ? impl_->dsp->weight_bytes() + impl_->dsp->scratch_bytes() + impl_->tap_bytes : 0;
+}
+void Engine::SetDSparkFaultForTest(int mask) {
+  const std::lock_guard lock(mutex_);
+  impl_->dsp_fault = mask;
+}
+void Engine::SetFeatureSink(FeatureSink sink) {
+  const std::lock_guard lock(mutex_);
+  impl_->fsink = std::move(sink);
+}
+std::size_t Engine::DSparkContext(const Session& s) const {
+  if (!impl_ || !impl_->dsp_on || s.dsp_ == nullptr || s.dsp_broken_ || s.dsp_->suspended) return 0;
+  const auto& st = *s.dsp_;
+  return st.cap_hi == s.pos_ && s.pos_ >= st.ctx_lo ? s.pos_ - st.ctx_lo : 0;
+}
+
+void Engine::DSparkColdStart(Session& s, std::size_t pos) {
+  const std::lock_guard lock(mutex_);
+  if (!impl_ || !impl_->dsp_on) return;
+  if (s.dsp_ != nullptr) dspark::Drafter::NewSegment(*s.dsp_, pos);
+}
+
+bool Engine::DSparkRewind(Session& s, std::size_t pos) {
+  const std::lock_guard lock(mutex_);
+  if (!impl_ || !impl_->dsp_on || s.dsp_ == nullptr) return false;
+  if (s.dsp_broken_) {
+    dspark::Drafter::NewSegment(*s.dsp_, pos);
+    return false;
+  }
+  try {
+    Check(hipStreamSynchronize(impl_->s), "rewind sync");
+    Check(hipStreamSynchronize(impl_->ds), "rewind sync");
+    return impl_->dsp->Rewind(*s.dsp_, pos, impl_->ds);
+  } catch (const std::exception& e) {
+    impl_->DspBreak(s, "the rewind", e.what());
+    return false;
+  }
+}
+
+bool Engine::DSparkWarm(const Session& s) const {
+  return impl_ && impl_->dsp_on && s.dsp_ != nullptr && !s.dsp_broken_ && !s.dsp_->suspended && s.dsp_->frnn_ok && s.dsp_->ctx_hi == s.pos_ &&
+         s.dsp_->cap_hi == s.pos_;
+}
+
+int Engine::DraftDSpark(Session& s, std::int32_t anchor, int k, std::int32_t* out, dspark::Trace* trace, std::size_t pos0) {
+  const std::lock_guard lock(mutex_);
+  if (!impl_->dsp_on) throw std::logic_error("inkling2: no DSpark drafter loaded");
+  if (anchor < 0 || static_cast<std::uint32_t>(anchor) >= weights_.config.n_vocab_text) throw std::runtime_error("inkling2: token id out of range");
+  if (pos0 == static_cast<std::size_t>(-1)) pos0 = s.pos_;
+  Check(hipStreamSynchronize(impl_->s), "pre-draft sync");  // prefill injection runs on the prefill stream
+  dspark::SessionState* st = impl_->DspState(s);
+  if (st == nullptr) return 0;  // this session's drafter is off
+  try {
+    return impl_->dsp->Draft(*st, anchor, pos0, k, out, trace, impl_->ds);
+  } catch (const std::exception& e) {
+    impl_->DspBreak(s, "a draft", e.what());  // the session's drafter is off from here; the caller still sees the failure
+    throw;
+  }
+}
+
+void Engine::InjectFeatures(Session& s, std::size_t first, std::size_t count, const float* feats) {
+  const std::lock_guard lock(mutex_);
+  if (!impl_->dsp_on) throw std::logic_error("inkling2: no DSpark drafter loaded");
+  Check(hipStreamSynchronize(impl_->s), "pre-inject sync");
+  dspark::SessionState* stp = impl_->DspState(s);
+  if (stp == nullptr) throw std::runtime_error("inkling2: the drafter of this session is off");
+  dspark::SessionState& st = *stp;
+  constexpr std::size_t kPart = 512;
+  float* dev = static_cast<float*>(AllocDevice(std::min(count, kPart) * dspark::kFeat * 4, "feature upload"));
+  try {
+    for (std::size_t at = 0; at < count; at += kPart) {
+      const std::size_t n = std::min(kPart, count - at);
+      Check(hipMemcpy(dev, feats + at * dspark::kFeat, n * dspark::kFeat * 4, hipMemcpyHostToDevice), "feature upload");
+      impl_->dsp->Inject(st, dev, dspark::kFeat, static_cast<int>(n), first + at, impl_->ds);
+    }
+  } catch (...) {
+    (void)hipFree(dev);
+    throw;
+  }
+  (void)hipFree(dev);
 }
 
 void Engine::Synchronize() {

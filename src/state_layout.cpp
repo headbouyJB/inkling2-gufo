@@ -8,6 +8,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include "src/dspark.hpp"
 #include "src/engine.hpp"
 
 namespace gufo::models::inkling2 {
@@ -171,6 +172,9 @@ void SessionStateAccess::ConvVisitIn(Session& s, std::uint32_t visit, std::size_
 void SessionStateAccess::SetFrontier(Session& s, std::size_t position, const float* logits,
                                      std::size_t n) {
   s.pos_ = position;
+  // A restored frontier: the drafter's contents belong to whatever the session held before. They are suspended (no drafting), not dropped: the
+  // runner knows the tokens (ReconcileComponentState / PreparePrefixReuse) and either keeps the context that is still valid (DSparkRewind) or starts over.
+  if (s.dsp_ != nullptr) dspark::Drafter::Suspend(*s.dsp_, position);
   if (logits != nullptr)
     s.logits_.assign(logits, logits + n);
   else
