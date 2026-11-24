@@ -1,0 +1,101 @@
+{
+ "label": "dspark-lookup",
+ "base_url": "http://127.0.0.1:5836",
+ "timestamp": "2026-11-24T21:28:58Z",
+ "reps": 2,
+ "max_tokens": 128,
+ "workloads": {
+  "chat": {
+   "decode_tps": 48.6,
+   "draft_accepted": 26,
+   "draft_proposed": 52,
+   "samples": [
+    {
+     "decode_tps": 48.559003815458986,
+     "completion_tokens": 42,
+     "draft_accepted": 13,
+     "draft_proposed": 26,
+     "wall_s": 1.061,
+     "content_head": "A mixture-of-experts model is an architecture where a small "
+    },
+    {
+     "decode_tps": 48.718216474813076,
+     "completion_tokens": 42,
+     "draft_accepted": 13,
+     "draft_proposed": 26,
+     "wall_s": 1.058,
+     "content_head": "A mixture-of-experts model is an architecture where a small "
+    }
+   ]
+  },
+  "math": {
+   "decode_tps": 56.5,
+   "draft_accepted": 116,
+   "draft_proposed": 168,
+   "samples": [
+    {
+     "decode_tps": 56.491145210707224,
+     "completion_tokens": 113,
+     "draft_accepted": 58,
+     "draft_proposed": 84,
+     "wall_s": 2.198,
+     "content_head": "17 \u00d7 23:\n17 \u00d7 20 = 340\n17 \u00d7 3 = 51\n340 + 51 = 391\n\n144 \u00f7 12:"
+    },
+    {
+     "decode_tps": 56.45357681244772,
+     "completion_tokens": 113,
+     "draft_accepted": 58,
+     "draft_proposed": 84,
+     "wall_s": 2.199,
+     "content_head": "17 \u00d7 23:\n17 \u00d7 20 = 340\n17 \u00d7 3 = 51\n340 + 51 = 391\n\n144 \u00f7 12:"
+    }
+   ]
+  },
+  "code": {
+   "decode_tps": 49.7,
+   "draft_accepted": 82,
+   "draft_proposed": 160,
+   "samples": [
+    {
+     "decode_tps": 49.72793379004093,
+     "completion_tokens": 112,
+     "draft_accepted": 41,
+     "draft_proposed": 80,
+     "wall_s": 2.451,
+     "content_head": "def reverse_string(s):\n    \"\"\"\n    Reverses the characters i"
+    },
+    {
+     "decode_tps": 49.71173339798355,
+     "completion_tokens": 112,
+     "draft_accepted": 41,
+     "draft_proposed": 80,
+     "wall_s": 2.452,
+     "content_head": "def reverse_string(s):\n    \"\"\"\n    Reverses the characters i"
+    }
+   ]
+  },
+  "copy": {
+   "decode_tps": 102.3,
+   "draft_accepted": 96,
+   "draft_proposed": 96,
+   "samples": [
+    {
+     "decode_tps": 101.60255943253335,
+     "completion_tokens": 59,
+     "draft_accepted": 48,
+     "draft_proposed": 48,
+     "wall_s": 0.829,
+     "content_head": "The maintenance manual for the coastal weather station descr"
+    },
+    {
+     "decode_tps": 102.94204203560469,
+     "completion_tokens": 59,
+     "draft_accepted": 48,
+     "draft_proposed": 48,
+     "wall_s": 0.818,
+     "content_head": "The maintenance manual for the coastal weather station descr"
+    }
+   ]
+  }
+ }
+}

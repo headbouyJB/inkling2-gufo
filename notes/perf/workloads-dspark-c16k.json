@@ -1,0 +1,78 @@
+{
+ "label": "dspark-c16k",
+ "base_url": "http://127.0.0.1:5836",
+ "timestamp": "2026-11-24T21:30:26Z",
+ "reps": 1,
+ "depth": 16000,
+ "max_tokens": 128,
+ "workloads": {
+  "chat": {
+   "prompt_tokens": 13563,
+   "decode_tps": 40.8,
+   "draft_accepted": 1,
+   "draft_proposed": 2,
+   "samples": [
+    {
+     "prompt_tokens": 13563,
+     "decode_tps": 40.787758728904976,
+     "completion_tokens": 42,
+     "draft_accepted": 1,
+     "draft_proposed": 2,
+     "wall_s": 10.033,
+     "content_head": "The user repeated a sentence about a maintenance manual and "
+    }
+   ]
+  },
+  "math": {
+   "prompt_tokens": 13568,
+   "decode_tps": 50.2,
+   "draft_accepted": 56,
+   "draft_proposed": 65,
+   "samples": [
+    {
+     "prompt_tokens": 13568,
+     "decode_tps": 50.16308923638251,
+     "completion_tokens": 128,
+     "draft_accepted": 56,
+     "draft_proposed": 65,
+     "wall_s": 11.441,
+     "content_head": "17*23 = 391\n144/12 = 12\n3^7 = 2187\n\nSteps:\n- 17*23: 17*20 = "
+    }
+   ]
+  },
+  "code": {
+   "prompt_tokens": 13565,
+   "decode_tps": 45.8,
+   "draft_accepted": 38,
+   "draft_proposed": 52,
+   "samples": [
+    {
+     "prompt_tokens": 13565,
+     "decode_tps": 45.78411548370677,
+     "completion_tokens": 128,
+     "draft_accepted": 38,
+     "draft_proposed": 52,
+     "wall_s": 11.676,
+     "content_head": "The user has repeated a sentence about a maintenance manual "
+    }
+   ]
+  },
+  "copy": {
+   "prompt_tokens": 13616,
+   "decode_tps": 52.7,
+   "draft_accepted": 26,
+   "draft_proposed": 26,
+   "samples": [
+    {
+     "prompt_tokens": 13616,
+     "decode_tps": 52.69287048582746,
+     "completion_tokens": 59,
+     "draft_accepted": 26,
+     "draft_proposed": 26,
+     "wall_s": 10.07,
+     "content_head": "The maintenance manual for the coastal weather station descr"
+    }
+   ]
+  }
+ }
+}

@@ -1,0 +1,78 @@
+{
+ "label": "dsp-topk0",
+ "base_url": "http://127.0.0.1:5836",
+ "timestamp": "2026-11-24T21:32:49Z",
+ "reps": 1,
+ "depth": 4000,
+ "max_tokens": 128,
+ "workloads": {
+  "chat": {
+   "prompt_tokens": 3414,
+   "decode_tps": 44.5,
+   "draft_accepted": 6,
+   "draft_proposed": 9,
+   "samples": [
+    {
+     "prompt_tokens": 3414,
+     "decode_tps": 44.482878576947044,
+     "completion_tokens": 47,
+     "draft_accepted": 6,
+     "draft_proposed": 9,
+     "wall_s": 3.411,
+     "content_head": "A mixture-of-experts model is a machine learning architectur"
+    }
+   ]
+  },
+  "math": {
+   "prompt_tokens": 3419,
+   "decode_tps": 51.3,
+   "draft_accepted": 51,
+   "draft_proposed": 63,
+   "samples": [
+    {
+     "prompt_tokens": 3419,
+     "decode_tps": 51.26573507867876,
+     "completion_tokens": 128,
+     "draft_accepted": 51,
+     "draft_proposed": 63,
+     "wall_s": 4.856,
+     "content_head": "17*23 = 391\n144/12 = 12\n3^7 = 2187\n\nSteps:\n- 17*23: 17*20 = "
+    }
+   ]
+  },
+  "code": {
+   "prompt_tokens": 3416,
+   "decode_tps": 43.7,
+   "draft_accepted": 10,
+   "draft_proposed": 20,
+   "samples": [
+    {
+     "prompt_tokens": 3416,
+     "decode_tps": 43.689441737771475,
+     "completion_tokens": 86,
+     "draft_accepted": 10,
+     "draft_proposed": 20,
+     "wall_s": 4.272,
+     "content_head": "def reverse_string(s):\n    \"\"\"\n    Reverses a given string.\n"
+    }
+   ]
+  },
+  "copy": {
+   "prompt_tokens": 3467,
+   "decode_tps": 54.8,
+   "draft_accepted": 24,
+   "draft_proposed": 24,
+   "samples": [
+    {
+     "prompt_tokens": 3467,
+     "decode_tps": 54.77350868223615,
+     "completion_tokens": 59,
+     "draft_accepted": 24,
+     "draft_proposed": 24,
+     "wall_s": 3.396,
+     "content_head": "The maintenance manual for the coastal weather station descr"
+    }
+   ]
+  }
+ }
+}
