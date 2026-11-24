@@ -38,8 +38,22 @@ NAME=${NAME:-inkling2-matrix}
 CTX=${CTX:-65536}
 SESSIONS=${SESSIONS:-2}
 REPS=${REPS:-2}
+# Thermal guard. A 16K prefill is ~11 s of sustained GEMM; on this box the APU
+# reaches 92 C and the sustained clock drops, which cost 12 % on prefill-16k
+# between two back-to-back runs (1,548 -> 1,369 tok/s) while the short decode
+# bursts reproduced to 0.2 %. So: cool to COOL_C before every mode and record
+# the edge temperature around each mode with the numbers.
+COOL_C=${COOL_C:-76}
+HWMON=$(ls -d /sys/class/drm/card*/device/hwmon/hwmon* 2>/dev/null | head -1)
 CASES=${CASES:-prefill-4k,prefill-16k,decode-short,decode-1k,decode-4k,decode-16k,batch2-1k}
 MODES=${MODES:-"lookup-on/dspark-off lookup-off/dspark-off lookup-on/dspark-on lookup-off/dspark-on"}
+# A pinned nonce makes the prompts byte-identical across runs. Without it every
+# run invents new prompt text, and the speculative modes then move 10-20 %
+# between runs because how much of the answer is copyable changes with the
+# prefix (measured 2026-11-24: dspark-on decode-4k read 47.5 in one run and 65.4
+# in the next with unique nonces, 50.0 and 50.1 with this pinned one). Set
+# NONCE= (empty) for cache-busting-against-nothing fresh prompts on purpose.
+NONCE=${NONCE-014-baseline}
 OUTDIR=${OUTDIR:-$REPO/notes/perf}
 SWAP_URL=${SWAP_URL:-http://localhost:8080}
 DO_SWAP=1; KEEP=0
@@ -54,6 +68,9 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+nonce_args=()
+[ -n "$NONCE" ] && nonce_args=(--nonce "$NONCE")
 
 for tool in podman python3 curl; do
   command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
@@ -84,6 +101,29 @@ fi
 cleanup() { [ "$KEEP" = 0 ] && podman rm -f "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+gpu_temp_c() {
+  [ -n "$HWMON" ] && [ -f "$HWMON/temp1_input" ] || { echo 0; return; }
+  echo $(( $(cat "$HWMON/temp1_input") / 1000 ))
+}
+
+gpu_clock_mhz() {
+  [ -n "$HWMON" ] && [ -f "$HWMON/freq1_input" ] || { echo 0; return; }
+  echo $(( $(cat "$HWMON/freq1_input") / 1000000 ))
+}
+
+wait_cool() { # label
+  local t deadline=$(( $(date +%s) + 600 ))
+  t=$(gpu_temp_c)
+  [ "$t" -le "$COOL_C" ] && { echo "   start: ${t} C ($(gpu_clock_mhz) MHz)"; return; }
+  printf '   cooling from %s C to <=%s C' "$t" "$COOL_C"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 15; t=$(gpu_temp_c)
+    printf ' %s' "$t"
+    [ "$t" -le "$COOL_C" ] && { printf ' C\n'; return; }
+  done
+  printf ' C (timeout; measuring anyway)\n'
+}
+
 run_mode() { # mode
   # Two separate arrays: -e goes to podman, --speculative/--dspark-model go to
   # `gufo serve` after the image name. Putting both in one array makes podman
@@ -103,6 +143,9 @@ run_mode() { # mode
   podman rm -f "$NAME" >/dev/null 2>&1 || true
   echo
   echo "== mode $mode  (lookup $lookup, dspark $dspark)"
+  local temp_start temp_end
+  wait_cool
+  temp_start=$(gpu_temp_c)
   podman run -d --name "$NAME" --replace --cgroups=split --stop-timeout 60 \
     --ulimit memlock=-1:-1 --group-add keep-groups \
     --device /dev/kfd --device /dev/dri \
@@ -123,9 +166,40 @@ run_mode() { # mode
   curl -sf -m 2 "http://127.0.0.1:$PORT/ready" >/dev/null || { echo "server did not come up" >&2; exit 1; }
   echo "   load: $(( $(date +%s) - t0 ))s"
 
-  python3 "$HERE/bench.py" --base-url "http://127.0.0.1:$PORT" --reps "$REPS" \
-    --cases "$CASES" --label "$label" --out "$OUTDIR/baseline-${mode//\//-}.json"
+  # One case per bench.py call, with a cool-down before each: a 16K prefill is
+  # ~11 s of sustained GEMM and back-to-back cases drop the sustained clock
+  # (measured: prefill-16k 1,502 then 1,330 in the same mode, decode-16k's
+  # prefill 1,275 then 1,195). Per-case cooling makes every number a cold-start
+  # number, which is the only kind that compares across builds.
+  local case thermals="" parts="$OUTDIR/parts"
+  mkdir -p "$parts"
+  for case in ${CASES//,/ }; do
+    wait_cool
+    # shellcheck disable=SC2086  # BENCH_EXTRA is a flag list on purpose (e.g. "--nonce pinned")
+    python3 "$HERE/bench.py" --base-url "http://127.0.0.1:$PORT" --reps "$REPS" \
+      --cases "$case" --label "$label $case" "${nonce_args[@]}" ${BENCH_EXTRA:-} \
+      --out "$parts/${mode//\//-}__$case.json" || return 1
+    thermals="$thermals ${case}:$(gpu_temp_c)C"
+  done
+  python3 - "$parts" "$mode" "$OUTDIR" "$label" <<'MERGEPY'
+import glob, json, os, sys
+parts, mode, outdir, label = sys.argv[1:5]
+merged = {"label": label, "mode": mode, "median": {}, "samples": {}, "cases": []}
+for path in sorted(glob.glob(os.path.join(parts, mode.replace("/", "-") + "__*.json"))):
+    data = json.load(open(path))
+    for case, med in data["median"].items():
+        merged["median"][case] = med
+        merged["samples"][case] = data["samples"].get(case, [])
+        merged["cases"].append(case)
+json.dump(merged, open(os.path.join(outdir, "baseline-" + mode.replace("/", "-") + ".json"), "w"), indent=1)
+print("   merged:", json.dumps(merged["median"]))
+MERGEPY
 
+  temp_end=$(gpu_temp_c)
+  printf '{"mode": "%s", "temp_start_c": %s, "temp_end_c": %s, "clock_mhz": %s, "cool_c": %s}\n' \
+    "$mode" "$temp_start" "$temp_end" "$(gpu_clock_mhz)" "$COOL_C" \
+    > "$OUTDIR/thermal-${mode//\//-}.json"
+  echo "   gpu: ${temp_start} C -> ${temp_end} C, $(gpu_clock_mhz) MHz; starts:$thermals"
   podman logs "$NAME" 2>&1 | grep -o 'speculative=[a-z]* draft_limit=[0-9]*' | tail -1 || true
   podman rm -f "$NAME" >/dev/null 2>&1 || true
   awk '/MemAvailable/ {printf "   host MemAvailable: %.1f GiB\n", $2/1048576}' /proc/meminfo
@@ -139,8 +213,9 @@ if [ "$DO_SWAP" = 1 ]; then
   echo
   echo "== llama-swap rows (:8080, the entry as configured)"
   [ -n "${AI_BOX_API_KEY:-}" ] || { echo "AI_BOX_API_KEY unset; skipping the swap rows" >&2; exit 0; }
+  # shellcheck disable=SC2086
   python3 "$HERE/bench.py" --base-url "$SWAP_URL" --api-key "$AI_BOX_API_KEY" --unload-first \
-    --reps "$REPS" --cases "${SWAP_CASES:-prefill-4k,decode-short,decode-4k}" \
+    --reps "$REPS" --cases "${SWAP_CASES:-prefill-4k,decode-short,decode-4k}" "${nonce_args[@]}" ${BENCH_EXTRA:-} \
     --label "0.1.4 llama-swap as configured" --out "$OUTDIR/baseline-swap.json"
 fi
 

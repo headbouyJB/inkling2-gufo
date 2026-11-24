@@ -1,0 +1,48 @@
+{
+ "label": "0.1.4 lookup-off/dspark-on decode-16k",
+ "base_url": "http://127.0.0.1:5834",
+ "model": "inkling-2-mini",
+ "nonce": "014-baseline",
+ "seed": 1234,
+ "reps": 2,
+ "cases": [
+  "decode-16k"
+ ],
+ "median": {
+  "decode-16k": 38.1
+ },
+ "summary": {
+  "decode-16k": {
+   "metric": "decode",
+   "tok_s": [
+    37.76384994935228,
+    38.52278283363354
+   ]
+  }
+ },
+ "samples": {
+  "decode-16k": [
+   {
+    "prompt_tokens": 16324,
+    "completion_tokens": 64,
+    "cached_tokens": 0,
+    "prefill_tps": 1465.9228729426156,
+    "decode_tps": 37.76384994935228,
+    "draft_tokens": 12,
+    "draft_tokens_accepted": 8,
+    "wall_s": 12.834
+   },
+   {
+    "prompt_tokens": 16324,
+    "completion_tokens": 64,
+    "cached_tokens": 0,
+    "prefill_tps": 1482.1086679246205,
+    "decode_tps": 38.52278283363354,
+    "draft_tokens": 4,
+    "draft_tokens_accepted": 1,
+    "wall_s": 12.679
+   }
+  ]
+ },
+ "timestamp": "2026-11-24T21:10:35Z"
+}
