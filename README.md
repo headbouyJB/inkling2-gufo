@@ -1,6 +1,6 @@
 # inkling2
 
-> **Inkling 2 Mini is coming to Gufo core.** The Gufo maintainers are bringing the model in-tree, building on this extension's code ([gufo-org/gufo#1340](https://github.com/gufo-org/gufo/pull/1340), a draft at the time of writing, aimed at Gufo v0.37.0). Once it ships, use the built-in model: it is faster and does not need this extension. This extension stays for current Gufo releases.
+> **This extension is retired.** Inkling 2 Mini is built into Gufo from **v0.37.0** ([gufo-org/gufo#1340](https://github.com/gufo-org/gufo/pull/1340)), with vision, DSpark and tool calls, and it is faster than this extension. Use Gufo 0.37.0 or later instead. The extension was withdrawn from the registry in [gufo-org/gufo-extension#37](https://github.com/gufo-org/gufo-extension/pull/37). This repository is archived; release 0.1.4 stays here for reference (built and tested against Gufo 0.35.0).
 
 A [Gufo](https://github.com/gufo-org/gufo) model extension that runs Inkling 2 Mini
 (Thinking Machines, 26B mixture-of-experts, 3 loop passes) on AMD Strix Halo (gfx1151, ROCm/HIP).
